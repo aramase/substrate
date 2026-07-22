@@ -106,6 +106,48 @@ different worker), and confirm the count continues — the actor's counter lives
 guest RAM, so a continuing count proves the guest-memory snapshot survived the
 round trip.
 
+## Measuring restore-to-useful-work (working-set benchmark)
+
+The counter can also act as a restore-latency reproducer. A memory-heavy agent
+(model weights, KV-cache, context) pays a demand-fault cost the first time it
+touches its working set after a resume: with `OnDemand` restore, guest RAM is
+faulted in lazily, so the first access to an un-faulted region blocks. This knob
+makes that cost measurable.
+
+- **`WORKING_SET_MIB`** (env, default `0` = off): allocate a resident, non-zero
+  region of this many MiB at startup. It is captured in the snapshot, so a resume
+  must fault it back in.
+- **`/work`** endpoint: reads the whole working set once, forcing every page
+  resident, and returns `touch_ms` — the in-guest time to fault + read it. Timing
+  it in-guest isolates the restore demand-fault cost from router/network latency.
+
+Non-zero fill matters: all-zero pages are sparsified out of the snapshot and would
+never fault back in, so the region carries a non-zero pattern to model real data.
+
+To reproduce:
+
+1. Deploy the micro-VM variant with the knob set (edit the `WORKING_SET_MIB` value
+   in [`counter-microvm.yaml.tmpl`](counter-microvm.yaml.tmpl), e.g. `"512"`, before
+   bring-up), then port-forward the router:
+
+   ```bash
+   kubectl port-forward -n ate-system svc/atenet-router 8000:80
+   ```
+
+2. Run the reproducer, which cycles suspend/resume and hits `/work` through the
+   router (the router auto-resumes the actor, so each request measures a cold
+   restore followed by the working-set touch):
+
+   ```bash
+   KUBECTL_CONTEXT=<ctx> demos/counter/bench-restore.sh 20
+   ```
+
+   It prints per-cycle `touch_ms` and a `min/p50/p95/max/avg` summary.
+
+This is the workload behind the micro-VM hugepage restore benchmark: 2 MiB
+hugepage-backed guest RAM turns the many small 4 KiB demand faults into far fewer
+2 MiB faults, cutting `touch_ms` substantially for large working sets.
+
 ## How to Uninstall
 
 To remove the counter demo resources from your cluster, run:

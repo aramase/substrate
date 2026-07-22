@@ -116,6 +116,14 @@ spec:
   - name: counter
     image: ko://github.com/agent-substrate/substrate/demos/counter
     command: ["/ko-app/counter"]
+    # Restore-perf reproducer knob. When >0, the counter allocates a resident,
+    # non-zero working set of this many MiB (captured in the snapshot) and the
+    # /work endpoint reads it, demand-faulting it on restore. Set to e.g. "512"
+    # and hit /work after each resume to measure restore-to-useful-work latency
+    # (see demos/counter/README.md). Default 0 keeps the plain suspend/resume demo.
+    env:
+    - name: WORKING_SET_MIB
+      value: "0"
     readyz:
       httpGet:
         path: /readyz
