@@ -34,6 +34,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/contextlogging"
 	"github.com/agent-substrate/substrate/internal/imagecache"
+	"github.com/agent-substrate/substrate/internal/logredact"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 	"github.com/agent-substrate/substrate/internal/readyz"
 	"github.com/agent-substrate/substrate/internal/serverboot"
@@ -91,7 +92,7 @@ func do(ctx context.Context) error {
 	defer cancel()
 
 	syncedWriter := actorlog.NewSyncedWriter(os.Stdout)
-	logger := slog.New(contextlogging.NewHandler(slog.NewJSONHandler(syncedWriter, nil)))
+	logger := slog.New(contextlogging.NewHandler(logredact.NewHandler(slog.NewJSONHandler(syncedWriter, nil))))
 	slog.SetDefault(logger)
 
 	slog.InfoContext(ctx, "ateom booting")

@@ -29,6 +29,7 @@ import (
 	"sync/atomic"
 
 	"github.com/agent-substrate/substrate/internal/contextlogging"
+	"github.com/agent-substrate/substrate/internal/logredact"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel"
@@ -43,6 +44,7 @@ import (
 )
 
 // InitLogger sets the global slog logger to a JSON handler wrapped in
+// logredact.NewHandler (redacts known credential formats) and
 // contextlogging.NewHandler, writing to os.Stdout. Call once at process start.
 func InitLogger() {
 	InitLoggerWithWriter(os.Stdout)
@@ -52,7 +54,7 @@ func InitLogger() {
 // one synchronized writer between the runtime logger and a separate writer (e.g.
 // ateom's actor-log forwarder) so their lines don't interleave.
 func InitLoggerWithWriter(w io.Writer) {
-	slog.SetDefault(slog.New(contextlogging.NewHandler(slog.NewJSONHandler(w, nil))))
+	slog.SetDefault(slog.New(contextlogging.NewHandler(logredact.NewHandler(slog.NewJSONHandler(w, nil)))))
 }
 
 // serviceInstanceID is generated once so the tracer and meter resources share it.

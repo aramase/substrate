@@ -32,6 +32,7 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/sessionidjwt"
 	"github.com/agent-substrate/substrate/internal/localca"
 	"github.com/agent-substrate/substrate/internal/localjwtauthority"
+	"github.com/agent-substrate/substrate/internal/logredact"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -87,7 +88,7 @@ func (s *Server) MintJWT(ctx context.Context, req *ateapipb.MintJWTRequest) (*at
 		return nil, status.Errorf(codes.Unauthenticated, "Unauthenticated")
 	}
 
-	slog.InfoContext(ctx, "Verified client JWT", slog.Any("claims", clientClaims))
+	slog.InfoContext(ctx, "Verified client JWT", slog.Attr{Key: "claims", Value: safeClientJWTClaims(clientClaims)})
 
 	// TODO: Extract K8s identity from incoming JWT
 
@@ -139,6 +140,59 @@ func (s *Server) MintJWT(ctx context.Context, req *ateapipb.MintJWTRequest) (*at
 	return &ateapipb.MintJWTResponse{
 		SessionJwt: sessionJWT,
 	}, nil
+}
+
+// loggableClientJWTClaims is the allow-list of verified-JWT claims MintJWT
+// records for its audit log. Every field is non-secret K8s identity/validity
+// metadata, so all are logged in clear. The value of the allow-list is
+// future-proofing: a claim later added to k8sjwt.KubernetesClaims is not logged
+// until added here deliberately. It is logged via logredact.Redact so that, as
+// a backstop, any field value that matches a credential format is still
+// redacted, and a genuinely sensitive field added later can be dropped with a
+// `log:"redact"` tag.
+type loggableClientJWTClaims struct {
+	Issuer             string
+	Subject            string
+	Audiences          []string
+	Expiration         time.Time
+	NotBefore          time.Time
+	IssuedAt           time.Time
+	JTI                string
+	Namespace          string
+	ServiceAccountName string
+	ServiceAccountUID  string
+	PodName            string
+	PodUID             string
+	SecretName         string
+	SecretUID          string
+	NodeName           string
+	NodeUID            string
+	WarnAfter          time.Time
+}
+
+func safeClientJWTClaims(claims *k8sjwt.KubernetesClaims) slog.Value {
+	if claims == nil {
+		return logredact.Redact(nil)
+	}
+	return logredact.Redact(loggableClientJWTClaims{
+		Issuer:             claims.Issuer,
+		Subject:            claims.Subject,
+		Audiences:          claims.Audiences,
+		Expiration:         claims.Expiration,
+		NotBefore:          claims.NotBefore,
+		IssuedAt:           claims.IssuedAt,
+		JTI:                claims.JTI,
+		Namespace:          claims.Namespace,
+		ServiceAccountName: claims.ServiceAccountName,
+		ServiceAccountUID:  claims.ServiceAccountUID,
+		PodName:            claims.PodName,
+		PodUID:             claims.PodUID,
+		SecretName:         claims.SecretName,
+		SecretUID:          claims.SecretUID,
+		NodeName:           claims.NodeName,
+		NodeUID:            claims.NodeUID,
+		WarnAfter:          claims.WarnAfter,
+	})
 }
 
 func (s *Server) MintCert(ctx context.Context, req *ateapipb.MintCertRequest) (*ateapipb.MintCertResponse, error) {
