@@ -260,6 +260,10 @@ func (w *ActorWorkflow) ensureAteletSuspended(ctx context.Context, actorRef reso
 		Scope:    toAteletSnapshotScope(commitSnapshotScope(actor.GetMetadata().GetAtespace(), actorTemplate)),
 		ActorUid: actor.GetMetadata().Uid,
 	}
+	// The node writes the actor's snapshot; mint a write capability for it.
+	if req.SignedAccess, err = w.writeAccessFor(ctx, snapshotURI.String()); err != nil {
+		return "", err
+	}
 	wireSnapshotScope = ateattr.SnapshotScopeValue(req.Scope)
 
 	_, err = client.Checkpoint(ctx, req)
@@ -311,6 +315,11 @@ func (w *ActorWorkflow) ensurePausedSnapshotUploaded(ctx context.Context, actorR
 		// The commit scope, like a running-origin suspend; atelet converts
 		// from the captured scope in the snapshot's manifest where possible.
 		DesiredScope: toAteletSnapshotScope(commitSnapshotScope(actor.GetMetadata().GetAtespace(), actorTemplate)),
+	}
+	// The node writes the paused snapshot to its destination; mint a write
+	// capability for it.
+	if req.SignedAccess, err = w.writeAccessFor(ctx, snapshotURI.String()); err != nil {
+		return "", err
 	}
 	wireSnapshotScope = ateattr.SnapshotScopeValue(req.DesiredScope)
 
