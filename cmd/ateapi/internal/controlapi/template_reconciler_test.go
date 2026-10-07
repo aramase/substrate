@@ -165,6 +165,7 @@ type fakeGoldenControl struct {
 	exists         bool
 	goldenState    ateapipb.ActorState
 	goldenSnapshot string
+	crashMessage   string
 	// snapshot is the external snapshot a completed suspend produces; empty
 	// simulates a suspend that wrote none.
 	snapshot string
@@ -213,7 +214,11 @@ func (c *fakeGoldenControl) GetActor(_ context.Context, req *ateapipb.GetActorRe
 	}
 	return &ateapipb.Actor{
 		Metadata: &ateapipb.ResourceMetadata{Atespace: req.GetActor().GetAtespace(), Name: req.GetActor().GetName()},
-		Status:   &ateapipb.ActorStatus{State: c.goldenState, ExternalSnapshot: &ateapipb.ExternalSnapshot{SnapshotUri: c.goldenSnapshot}},
+		Status: &ateapipb.ActorStatus{
+			State:            c.goldenState,
+			ExternalSnapshot: &ateapipb.ExternalSnapshot{SnapshotUri: c.goldenSnapshot},
+			Crash:            &ateapipb.ActorCrash{Message: c.crashMessage},
+		},
 	}, nil
 }
 
@@ -395,6 +400,9 @@ func TestReconcileOne(t *testing.T) {
 		// stored error message must be empty. Checked when template is seeded.
 		wantFailedReason string
 		wantMessage      string
+		// wantNotMessage lists substrings the stored error message must not
+		// contain.
+		wantNotMessage []string
 		// wantTag indicates that the golden tag should be recorded.
 		wantTag bool
 		// wantDeadline asserts whether take_golden_snapshot_at is set.
@@ -491,11 +499,23 @@ func TestReconcileOne(t *testing.T) {
 			wantCreates: 1,
 		},
 		{
-			name:             "crashed golden actor fails the template",
+			name:     "crashed golden actor names the actor without copying its crash message",
+			template: testTemplate(),
+			control: &fakeGoldenControl{
+				exists:       true,
+				goldenState:  ateapipb.ActorState_ACTOR_STATE_CRASHED,
+				crashMessage: "atelet Run: pull https://user:fake-secret-token@registry.example.com/img: UNAUTHORIZED",
+			},
+			wantFailedReason: reasonGoldenActorCrashed,
+			wantMessage:      "golden actor " + resources.GoldenActorAtespace + "/" + testTemplateUID + " crashed before its snapshot was taken; see the actor's crash status",
+			wantNotMessage:   []string{"fake-secret-token", "atelet Run", "UNAUTHORIZED"},
+		},
+		{
+			name:             "crashed golden actor without a crash message names the actor",
 			template:         testTemplate(),
 			control:          &fakeGoldenControl{exists: true, goldenState: ateapipb.ActorState_ACTOR_STATE_CRASHED},
 			wantFailedReason: reasonGoldenActorCrashed,
-			wantMessage:      "crashed",
+			wantMessage:      "golden actor " + resources.GoldenActorAtespace + "/" + testTemplateUID + " crashed",
 		},
 		{
 			name:        "resume failure requeues without failing",
@@ -590,6 +610,11 @@ func TestReconcileOne(t *testing.T) {
 				}
 				if !strings.Contains(errorMessage, tt.wantMessage) {
 					t.Errorf("stored error message = %q, want it to contain %q", errorMessage, tt.wantMessage)
+				}
+			}
+			for _, unwanted := range tt.wantNotMessage {
+				if strings.Contains(errorMessage, unwanted) {
+					t.Errorf("stored error message = %q, want it not to contain %q", errorMessage, unwanted)
 				}
 			}
 			if got := snapshotStatus.GetGoldenTag(); (got != nil) != tt.wantTag {

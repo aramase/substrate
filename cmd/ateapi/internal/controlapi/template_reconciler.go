@@ -244,7 +244,10 @@ func (r *ActorTemplateReconciler) reconcileOne(ctx context.Context, ref resource
 
 		switch state := actor.GetStatus().GetState(); state {
 		case ateapipb.ActorState_ACTOR_STATE_CRASHED:
-			return 0, r.fail(ctx, tmpl, reasonGoldenActorCrashed, "golden actor crashed before its snapshot was taken")
+			// Name the actor rather than copying its crash message, which can
+			// hold atelet's unsanitized error text; see ateletCrashMessage.
+			msg := fmt.Sprintf("golden actor %s crashed before its snapshot was taken; see the actor's crash status", resources.ActorRefFromObjectRef(goldenActorRef))
+			return 0, r.fail(ctx, tmpl, reasonGoldenActorCrashed, msg)
 
 		case ateapipb.ActorState_ACTOR_STATE_RUNNING:
 			takeAt := goldenSnapshotStatus.GetTakeGoldenSnapshotAt()
