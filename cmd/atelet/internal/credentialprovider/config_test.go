@@ -15,7 +15,10 @@
 package credentialprovider
 
 import (
+	"errors"
+	"io/fs"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -275,7 +278,20 @@ providers:
 
 func TestLoadConfigMissingFile(t *testing.T) {
 	t.Parallel()
-	if _, err := loadConfig(filepath.Join(t.TempDir(), "absent.yaml"), "/bin"); err == nil {
+	path := filepath.Join(t.TempDir(), "absent.yaml")
+	if _, err := loadConfig(path, "/bin"); err == nil {
 		t.Error("loadConfig accepted a missing config file, want an error")
+	} else if !strings.Contains(err.Error(), path) || !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("loadConfig error = %q, want path and missing-file cause", err)
+	}
+}
+
+func TestLoadConfigEmptyFile(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, t.TempDir(), " \n\t")
+	if _, err := loadConfig(path, "/bin"); err == nil {
+		t.Error("loadConfig accepted an empty config file, want an error")
+	} else if want := "credential provider config " + `"` + path + `" is empty`; err.Error() != want {
+		t.Errorf("loadConfig error = %q, want %q", err, want)
 	}
 }

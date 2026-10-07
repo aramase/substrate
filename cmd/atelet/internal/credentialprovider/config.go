@@ -42,13 +42,16 @@ const (
 // provider's executable inside binDir, applying the kubelet's per-provider
 // validation.
 //
-// It errors only on the config as a whole (missing, unparseable, wrong kind),
+// It errors only on the config as a whole (missing, empty, unparseable, wrong kind),
 // which means atelet was pointed at the wrong file. Unusable providers are
 // skipped, so the result may be short or empty.
 func loadConfig(configPath, binDir string) ([]*plugin, error) {
 	raw, err := os.ReadFile(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("while reading credential provider config: %w", err)
+		return nil, fmt.Errorf("while reading credential provider config %q: %w", configPath, err)
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return nil, fmt.Errorf("credential provider config %q is empty", configPath)
 	}
 	var cfg kubeletconfigv1.CredentialProviderConfig
 	if err := yaml.UnmarshalStrict(raw, &cfg); err != nil {
