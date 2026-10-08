@@ -18,6 +18,7 @@ import (
 	"context"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
@@ -41,7 +42,8 @@ type fakeControl struct {
 	ateapipb.ControlClient
 	atespaces map[string]bool
 	// createErr, if set, is what CreateAtespace returns.
-	createErr      error
+	createErr error
+	// templateExists says whether templateRef, the only template, exists.
 	templateExists bool
 	actors         []*ateapipb.Actor
 	borrowers      int
@@ -100,7 +102,8 @@ func (f *fakeControl) DeleteActorTemplate(_ context.Context, req *ateapipb.Delet
 	if f.templateErr != nil {
 		return nil, f.templateErr
 	}
-	if !f.templateExists {
+	// The fake holds one template, templateRef.
+	if !f.templateExists || req.GetActorTemplate().GetName() != templateRef.GetName() {
 		return nil, status.Error(codes.NotFound, "not found")
 	}
 	inUse := f.borrowers > 0
@@ -322,6 +325,167 @@ func TestClaimAtespace(t *testing.T) {
 		fake.actors = []*ateapipb.Actor{actor(fixtureAtespace, "a", templateRef)}
 		if err := claim.Release(context.Background()); status.Code(err) != codes.FailedPrecondition {
 			t.Errorf("Release() of a non-empty atespace = %v, want code FailedPrecondition", err)
+		}
+	})
+}
+
+func TestTeardown(t *testing.T) {
+	const poolName = `Namespace "fixture" and its WorkerPool`
+	tests := []struct {
+		name string
+		fake *fakeControl
+		// noPool leaves the pool unset, as when setup failed before it.
+		noPool  bool
+		poolErr error
+		// wantCode is the code of Run's error; OK means it returns nil.
+		wantCode codes.Code
+		// wantInErr are substrings Run's error must contain.
+		wantInErr      []string
+		wantPoolDelete bool
+		wantRemaining  []string
+		wantTemplate   bool
+		wantAtespace   bool
+	}{
+		{
+			name: "only this run's actors use the templates",
+			fake: &fakeControl{templateExists: true, actors: []*ateapipb.Actor{
+				actor(fixtureAtespace, "own-1", templateRef),
+				actor(fixtureAtespace, "own-2", templateRef),
+			}},
+			wantCode:       codes.OK,
+			wantPoolDelete: true,
+		},
+		{
+			name: "a foreign live actor uses a template",
+			fake: &fakeControl{templateExists: true, actors: []*ateapipb.Actor{
+				actor(fixtureAtespace, "own", templateRef),
+				actor("team-b", "foreign", templateRef),
+			}},
+			wantCode:      codes.FailedPrecondition,
+			wantInErr:     []string{"tmpl", `atespace "fixture"`, poolName},
+			wantRemaining: []string{"team-b/foreign"},
+			wantTemplate:  true,
+			wantAtespace:  true,
+		},
+		{
+			name: "an actor borrows a template's golden snapshot",
+			fake: &fakeControl{templateExists: true, borrowers: 1},
+			// The borrower's location is unknown, so it may be on the pool.
+			wantCode:     codes.FailedPrecondition,
+			wantInErr:    []string{"tmpl", poolName},
+			wantTemplate: true,
+			wantAtespace: true,
+		},
+		{
+			name: "a template delete fails for another reason",
+			fake: &fakeControl{templateExists: true, templateErr: status.Error(codes.Unavailable, "unavailable"), actors: []*ateapipb.Actor{
+				actor("team-b", "foreign", templateRef),
+			}},
+			wantCode:      codes.Unavailable,
+			wantInErr:     []string{"tmpl", poolName},
+			wantRemaining: []string{"team-b/foreign"},
+			wantTemplate:  true,
+			wantAtespace:  true,
+		},
+		{
+			name:           "the pool delete fails",
+			fake:           &fakeControl{templateExists: true},
+			poolErr:        status.Error(codes.Internal, "kubectl failed"),
+			wantCode:       codes.Internal,
+			wantInErr:      []string{poolName},
+			wantPoolDelete: true,
+			// The atespace is empty, so it is released anyway.
+		},
+		{
+			name:     "setup failed before the pool was set",
+			fake:     &fakeControl{templateExists: true},
+			noPool:   true,
+			wantCode: codes.OK,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.fake.pageSize = 2
+			ctx := context.Background()
+			claim, err := ClaimAtespace(ctx, tt.fake, fixtureAtespace)
+			if err != nil {
+				t.Fatalf("ClaimAtespace() = %v", err)
+			}
+			td := claim.NewTeardown()
+			td.AddTemplate(templateRef.GetName())
+			// A second template that is already gone counts as deleted.
+			td.AddTemplate("gone")
+			poolDeleted := false
+			if !tt.noPool {
+				td.SetPool(poolName, func(context.Context) error {
+					// The pool goes only after every template.
+					if tt.fake.templateExists {
+						t.Errorf("pool deleted while template %s still exists", templateRef.GetName())
+					}
+					if !tt.fake.atespaces[fixtureAtespace] {
+						t.Errorf("pool deleted after the atespace was released")
+					}
+					poolDeleted = true
+					return tt.poolErr
+				})
+			}
+
+			err = td.Run(ctx, t.Logf)
+			if tt.wantCode == codes.OK {
+				if err != nil {
+					t.Fatalf("Run() = %v, want nil", err)
+				}
+			} else if got := status.Code(err); got != tt.wantCode {
+				t.Fatalf("Run() = %v, want code %v", err, tt.wantCode)
+			}
+			t.Logf("Run() = %v", err)
+			for _, want := range tt.wantInErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Run() error does not name %q: %v", want, err)
+				}
+			}
+			if poolDeleted != tt.wantPoolDelete {
+				t.Errorf("pool deleted = %v, want %v", poolDeleted, tt.wantPoolDelete)
+			}
+			if diff := cmp.Diff(tt.wantRemaining, names(tt.fake.actors)); diff != "" {
+				t.Errorf("remaining actors (-want +got):\n%s", diff)
+			}
+			if tt.fake.templateExists != tt.wantTemplate {
+				t.Errorf("template exists = %v, want %v", tt.fake.templateExists, tt.wantTemplate)
+			}
+			if got := tt.fake.atespaces[fixtureAtespace]; got != tt.wantAtespace {
+				t.Errorf("atespace exists = %v, want %v", got, tt.wantAtespace)
+			}
+		})
+	}
+
+	t.Run("a rerun finishes once the foreign actor is gone", func(t *testing.T) {
+		ctx := context.Background()
+		fake := &fakeControl{pageSize: 2, templateExists: true}
+		claim, err := ClaimAtespace(ctx, fake, fixtureAtespace)
+		if err != nil {
+			t.Fatalf("ClaimAtespace() = %v", err)
+		}
+		fake.actors = []*ateapipb.Actor{actor("team-b", "foreign", templateRef)}
+		td := claim.NewTeardown()
+		td.AddTemplate(templateRef.GetName())
+		poolDeletes := 0
+		td.SetPool(poolName, func(context.Context) error {
+			poolDeletes++
+			return nil
+		})
+		if err := td.Run(ctx, t.Logf); status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("Run() with a foreign actor = %v, want code FailedPrecondition", err)
+		}
+		if poolDeletes != 0 {
+			t.Fatalf("pool deleted %d times while a foreign actor uses the template", poolDeletes)
+		}
+		fake.actors = nil
+		if err := td.Run(ctx, t.Logf); err != nil {
+			t.Fatalf("Run() after the foreign actor is gone = %v", err)
+		}
+		if poolDeletes != 1 || fake.templateExists || fake.atespaces[fixtureAtespace] {
+			t.Errorf("after rerun: pool deletes = %d, template exists = %v, atespace exists = %v; want 1, false, false", poolDeletes, fake.templateExists, fake.atespaces[fixtureAtespace])
 		}
 	})
 }

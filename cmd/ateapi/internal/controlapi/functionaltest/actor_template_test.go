@@ -25,6 +25,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/e2e/fixturecleanup"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"google.golang.org/grpc/status"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
@@ -560,12 +561,13 @@ func TestDeleteActorTemplate_RepointedActorBorrowingGolden(t *testing.T) {
 // TestFixtureClaim_SparesForeignActors runs the e2e fixture's atespace claim
 // and teardown against the real server. Run A claims an atespace, builds a
 // template there and leaves actors in it, NEW, SUSPENDED and RUNNING; a live
-// actor in another atespace also uses the template. Run B, of the same
-// fixture, cannot claim A's atespace and changes nothing in it. A's teardown
-// deletes A's actors, then stops: the foreign actor, its snapshot, the
-// template and the golden snapshot are left as they were. Once nothing
-// outside A's atespace uses the template, the teardown deletes the template
-// and the atespace, and the next run can claim it again.
+// actor in another atespace also uses the template and runs on the fixture
+// pool's workers. Run B, of the same fixture, cannot claim A's atespace and
+// changes nothing in it. A's teardown deletes A's actors, then stops: the
+// foreign actor, its snapshot, its worker, the pool, the template, the golden
+// snapshot and the atespace are left as they were. Once nothing outside A's
+// atespace uses the template, the teardown deletes the template, the pool and
+// the atespace, and the next run can claim it again.
 func TestFixtureClaim_SparesForeignActors(t *testing.T) {
 	ns := namespaceForTest("fixture-claim")
 	tc := setupTest(t, ns)
@@ -700,12 +702,26 @@ func TestFixtureClaim_SparesForeignActors(t *testing.T) {
 	assertSnapshotPresent(t, tc, ownRunningURI)
 	assertTemplateUnchanged("a second run's refused claim")
 
-	// Run A's teardown, with a foreign actor still using the template.
-	err = claim.DeleteTemplate(ctx, templateRef.GetName(), t.Logf)
+	// Run A's teardown, with a foreign actor still using the template and
+	// running on the fixture pool's workers. The pool's delete takes those
+	// workers away, as kubectl deleting the fixture's namespace does.
+	teardown := claim.NewTeardown()
+	teardown.AddTemplate(templateRef.GetName())
+	poolDeletes := 0
+	teardown.SetPool("WorkerPool pool1", func(ctx context.Context) error {
+		poolDeletes++
+		deleteWorkerPod(t, tc, ns, "worker-1")
+		deleteWorkerPod(t, tc, ns, "worker-2")
+		return tc.substrateClient.ApiV1alpha1().WorkerPools(ns).Delete(ctx, "pool1", metav1.DeleteOptions{})
+	})
+	err = teardown.Run(ctx, t.Logf)
 	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("DeleteTemplate with a foreign actor = %v, want code FailedPrecondition", err)
+		t.Fatalf("teardown with a foreign actor = %v, want code FailedPrecondition", err)
 	}
-	t.Logf("DeleteTemplate refused as expected: %v", err)
+	t.Logf("teardown refused as expected: %v", err)
+	if poolDeletes != 0 {
+		t.Errorf("teardown deleted the pool %d times while a foreign actor runs on it", poolDeletes)
+	}
 	for _, ref := range []*ateapipb.ObjectRef{ownNew, ownSuspended, ownRunning} {
 		if _, err := tc.client.GetActor(ctx, &ateapipb.GetActorRequest{Actor: ref}); status.Code(err) != codes.NotFound {
 			t.Errorf("GetActor(%s/%s) after the teardown = %v, want NotFound", ref.GetAtespace(), ref.GetName(), err)
@@ -716,23 +732,40 @@ func TestFixtureClaim_SparesForeignActors(t *testing.T) {
 	assertUnchanged("the refused teardown", foreignBefore)
 	assertSnapshotPresent(t, tc, foreignURI)
 	assertTemplateUnchanged("the refused teardown")
-	if err := claim.Release(ctx); status.Code(err) != codes.FailedPrecondition {
-		t.Errorf("Release with the template still in the atespace = %v, want code FailedPrecondition", err)
+	// The foreign actor's worker, and the pool it belongs to, are still
+	// there.
+	foreignWorker := foreignBefore.GetStatus().GetWorkerAssignment().GetWorker().GetName()
+	if w, err := tc.workerCache.Worker(foreignWorker); err != nil || w.GetStatus().GetState() != ateapipb.WorkerState_WORKER_STATE_ACTIVE {
+		t.Errorf("foreign actor's worker %q after the refused teardown = %v, %v, want ACTIVE", foreignWorker, w.GetStatus().GetState(), err)
+	}
+	for _, pod := range []string{"worker-1", "worker-2"} {
+		if _, err := tc.k8sClient.CoreV1().Pods(ns).Get(ctx, pod, metav1.GetOptions{}); err != nil {
+			t.Errorf("worker pod %s after the refused teardown: %v", pod, err)
+		}
+	}
+	if _, err := tc.substrateClient.ApiV1alpha1().WorkerPools(ns).Get(ctx, "pool1", metav1.GetOptions{}); err != nil {
+		t.Errorf("WorkerPool pool1 after the refused teardown: %v", err)
+	}
+	if _, err := tc.client.GetAtespace(ctx, &ateapipb.GetAtespaceRequest{Atespace: &ateapipb.ObjectRef{Name: fixtureAtespace}}); err != nil {
+		t.Errorf("GetAtespace(%s) after the refused teardown: %v", fixtureAtespace, err)
 	}
 
 	// Once the foreign actor is gone, the teardown finishes.
 	if _, err := tc.client.DeleteActor(ctx, &ateapipb.DeleteActorRequest{Actor: foreign, AnyState: true}); err != nil {
 		t.Fatalf("DeleteActor(foreign): %v", err)
 	}
-	if err := claim.DeleteTemplate(ctx, templateRef.GetName(), t.Logf); err != nil {
-		t.Fatalf("DeleteTemplate once only its own atespace's actors could use it: %v", err)
+	if err := teardown.Run(ctx, t.Logf); err != nil {
+		t.Fatalf("teardown once only its own atespace's actors could use the template: %v", err)
+	}
+	if poolDeletes != 1 {
+		t.Errorf("pool deletes after the teardown = %d, want 1", poolDeletes)
 	}
 	if _, err := tc.client.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{ActorTemplate: templateRef}); status.Code(err) != codes.NotFound {
 		t.Errorf("GetActorTemplate after the teardown = %v, want NotFound", err)
 	}
 	assertSnapshotCollected(t, tc, goldenURI)
-	if err := claim.Release(ctx); err != nil {
-		t.Fatalf("Release of the emptied atespace: %v", err)
+	if _, err := tc.client.GetAtespace(ctx, &ateapipb.GetAtespaceRequest{Atespace: &ateapipb.ObjectRef{Name: fixtureAtespace}}); status.Code(err) != codes.NotFound {
+		t.Errorf("GetAtespace(%s) after the teardown = %v, want NotFound", fixtureAtespace, err)
 	}
 	next, err := fixturecleanup.ClaimAtespace(ctx, tc.client, fixtureAtespace)
 	if err != nil {

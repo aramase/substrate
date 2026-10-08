@@ -19,7 +19,9 @@ package fixturecleanup
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
@@ -91,6 +93,74 @@ func (c *Claim) Release(ctx context.Context) error {
 		return fmt.Errorf("deleting atespace %q: %w", c.atespace, err)
 	}
 	return nil
+}
+
+// Teardown removes what a fixture run created in its claimed atespace and
+// the worker pool its templates select: first the ActorTemplates (with this
+// run's actors that use them), then the pool, then the atespace.
+//
+// The pool goes only once every template is gone. A template that is still
+// there may be used by an actor this run does not own, running on the pool's
+// workers, and deleting the pool would take those workers away.
+type Teardown struct {
+	claim      *Claim
+	templates  []string
+	pool       string
+	deletePool func(context.Context) error
+}
+
+// NewTeardown returns an empty Teardown for the claimed atespace. Run releases
+// the atespace even if nothing is added.
+func (c *Claim) NewTeardown() *Teardown {
+	return &Teardown{claim: c}
+}
+
+// AddTemplate adds an ActorTemplate in the claimed atespace for Run to delete.
+func (td *Teardown) AddTemplate(name string) {
+	td.templates = append(td.templates, name)
+}
+
+// SetPool sets how Run deletes the fixture's worker pool. name describes the
+// pool for an operator reading a leak report. deletePool must succeed when
+// the pool is already gone.
+func (td *Teardown) SetPool(name string, deletePool func(context.Context) error) {
+	td.pool = name
+	td.deletePool = deletePool
+}
+
+// Run deletes the templates, then the pool, then the atespace. It may be
+// called again after a failure.
+//
+// If any template is left, because an actor this run does not own still uses
+// it or because the delete failed, Run keeps the pool and the atespace too
+// and returns an error naming everything it kept. Otherwise it deletes the
+// pool and releases the atespace, and returns any error from either.
+func (td *Teardown) Run(ctx context.Context, logf func(format string, args ...any)) error {
+	var kept []string
+	var errs []error
+	for _, name := range td.templates {
+		if err := td.claim.DeleteTemplate(ctx, name, logf); err != nil {
+			kept = append(kept, name)
+			errs = append(errs, err)
+		}
+	}
+	if len(kept) > 0 {
+		pool := ""
+		if td.deletePool != nil {
+			pool = fmt.Sprintf(", nor %s, whose workers may run those actors", td.pool)
+		}
+		return fmt.Errorf("fixture left behind: ActorTemplates %s in atespace %q are not deleted, so this run deletes neither the atespace%s. Once no actor uses the templates, delete the templates, the pool and the atespace: %w",
+			strings.Join(kept, ", "), td.claim.atespace, pool, errors.Join(errs...))
+	}
+	if td.deletePool != nil {
+		if err := td.deletePool(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("deleting %s: %w", td.pool, err))
+		}
+	}
+	if err := td.claim.Release(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 func (c *Claim) deleteTemplate(ctx context.Context, ref *ateapipb.ObjectRef) error {

@@ -90,6 +90,13 @@ $ kubectl ate delete actor-template -a <atespace> <template>   # for each templa
 $ kubectl ate delete atespace <atespace>
 ```
 
+A run's teardown also stops short when an actor in another atespace still
+uses one of the fixture's ActorTemplates: that actor may be running on the
+fixture pool's workers, so the run keeps the template, the atespace and the
+pool's namespace, and fails with `fixture left behind`, naming them. Once that
+actor is gone, delete the same things as above, then the namespace with
+`kubectl delete namespace <atespace>`.
+
 ## Creating a new test suite
 
 Copy `testmain_test.go` from `internal/e2e/suites/example` into your new suite. It will

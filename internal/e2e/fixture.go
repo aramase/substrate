@@ -16,6 +16,8 @@ package e2e
 
 import (
 	"context"
+	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -120,8 +122,10 @@ type SubstrateFixtureManifests struct {
 // Everything is removed when the test ends. The substrate resources need
 // explicit cleanup — unlike the CRD templates they replaced, they do not ride
 // the k8s namespace GC. A template is deleted after the actors in the
-// fixture's atespace that still use it; an actor in any other atespace that
-// uses it is reported and left alone, and so are the template and atespace.
+// fixture's atespace that still use it. If an actor in any other atespace
+// still uses it, that actor, the template, the atespace and the pool with its
+// namespace are all left in place, since the actor may be running on the
+// pool's workers, and the test fails naming what was left.
 //
 // Returns the fixture's atespace (the same string that names the k8s
 // namespace holding the pool) and the created templates.
@@ -139,33 +143,32 @@ func DeploySubstrateFixture(t *testing.T, ctx context.Context, clients *Clients,
 		}
 	}
 
+	// The pool manifest also carries the namespace. It is rendered before
+	// the teardown is registered, so its file outlives the teardown that
+	// deletes it (t.Cleanup is LIFO).
+	inline, blocks := fixtureSubstitutions(bucket, name)
+	poolManifest := renderManifest(t, manifests.Pool, inline, blocks)
+
 	// Claimed before the pool is applied, so a run that cannot claim the
-	// atespace also leaves the pool and its namespace alone. Its cleanup is
-	// registered first so it runs last (t.Cleanup is LIFO).
+	// atespace also leaves the pool and its namespace alone.
 	claim, err := fixturecleanup.ClaimAtespace(ctx, clients.SubstrateAPI, atespace)
 	if err != nil {
 		t.Fatalf("failed to claim the fixture's atespace: %v", err)
 	}
+	teardown := claim.NewTeardown()
 	t.Cleanup(func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		if err := claim.Release(cleanupCtx); err != nil {
-			t.Logf("failed to release the fixture's atespace: %v", err)
+		if err := teardown.Run(cleanupCtx, t.Logf); err != nil {
+			t.Errorf("fixture teardown: %v", err)
 		}
 	})
 
-	// The pool manifest also carries the namespace. Its cleanup runs after
-	// the templates that select the pool's workers are gone.
-	inline, blocks := fixtureSubstitutions(bucket, name)
-	poolManifest := renderManifest(t, manifests.Pool, inline, blocks)
-	koApply(t, poolManifest)
-	t.Cleanup(func() {
-		delArgs := []string{"delete", "--ignore-not-found", "-f", poolManifest}
-		if KubeContext != "" {
-			delArgs = append([]string{"--context=" + KubeContext}, delArgs...)
-		}
-		RunCmd(t, "kubectl", delArgs...)
+	// Set before the apply, so a partly applied pool is deleted too.
+	teardown.SetPool(fmt.Sprintf("Namespace %q and its WorkerPool", atespace), func(ctx context.Context) error {
+		return kubectlDelete(ctx, t, poolManifest)
 	})
+	koApply(t, poolManifest)
 
 	created := make([]*ateapipb.ActorTemplate, 0, len(templates))
 	for _, tmpl := range templates {
@@ -173,15 +176,9 @@ func DeploySubstrateFixture(t *testing.T, ctx context.Context, clients *Clients,
 		if err != nil {
 			t.Fatalf("failed to create ActorTemplate %s/%s: %v", atespace, tmpl.GetMetadata().GetName(), err)
 		}
-		// Registered before the golden wait so a template whose golden never
+		// Added before the golden wait so a template whose golden never
 		// builds still gets cleaned up.
-		t.Cleanup(func() {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
-			defer cancel()
-			if err := claim.DeleteTemplate(cleanupCtx, c.GetMetadata().GetName(), t.Logf); err != nil {
-				t.Logf("failed to delete ActorTemplate %s/%s: %v", atespace, c.GetMetadata().GetName(), err)
-			}
-		})
+		teardown.AddTemplate(c.GetMetadata().GetName())
 		created = append(created, c)
 	}
 
@@ -190,4 +187,20 @@ func DeploySubstrateFixture(t *testing.T, ctx context.Context, clients *Clients,
 		WaitForSubstrateTemplateReady(ctx, t, clients, atespace, tmpl.GetMetadata().GetName())
 	}
 	return atespace, created
+}
+
+// kubectlDelete deletes the objects in manifest, succeeding if they are
+// already gone.
+func kubectlDelete(ctx context.Context, t *testing.T, manifest string) error {
+	args := []string{"delete", "--ignore-not-found", "-f", manifest}
+	if KubeContext != "" {
+		args = append([]string{"--context=" + KubeContext}, args...)
+	}
+	t.Logf("Running command: kubectl %s", strings.Join(args, " "))
+	out, err := exec.CommandContext(ctx, "kubectl", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("kubectl %s: %w\n%s", strings.Join(args, " "), err, out)
+	}
+	t.Logf("%s", out)
+	return nil
 }
