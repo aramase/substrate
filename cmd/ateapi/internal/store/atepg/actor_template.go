@@ -208,26 +208,149 @@ func (p *Persistence) ListActorTemplates(ctx context.Context, atespace string, o
 	return store.ListResponse[*ateapipb.ActorTemplate]{Items: result, NextPageToken: nextToken}, nil
 }
 
-func (p *Persistence) DeleteActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef, precondition store.DeletePreconditions) (*ateapipb.ActorTemplate, error) {
-	var protoBytes []byte
-	err := p.pool.QueryRow(ctx, `
-		DELETE FROM actor_templates AS t
-		WHERE t.atespace = $1 AND t.name = $2
-		  AND ($3::text = '' OR t.uid = $3::text)
-		  AND ($4::bigint = 0 OR t.version = $4::bigint)
-		RETURNING t.proto`, templateRef.Atespace, templateRef.Name, precondition.UID, precondition.Version).Scan(&protoBytes)
-	if errors.Is(err, pgx.ErrNoRows) {
-		var uid string
-		var version int64
-		err := p.pool.QueryRow(ctx, `SELECT uid, version FROM actor_templates WHERE atespace = $1 AND name = $2`, templateRef.Atespace, templateRef.Name).Scan(&uid, &version)
-		return nil, mapDeleteError(err, uid, version, precondition)
+// maxBlockingActors bounds how many blocking actors in the template's
+// atespace DeleteActorTemplate names.
+const maxBlockingActors = 5
+
+// MarkActorTemplateDeleting holds the template row FOR UPDATE from the
+// in-use check through setting deleting. CreateActor and a repointing
+// UpdateActor take the row FOR SHARE before writing the actor, so each either
+// commits before the check sees it or waits for the mark and then refuses.
+// The transaction ends with the mark, so the caller's cleanup holds no
+// connection or lock.
+func (p *Persistence) MarkActorTemplateDeleting(ctx context.Context, templateRef resources.ActorTemplateRef, precondition store.DeletePreconditions, blocks func(*ateapipb.ActorTemplate, *ateapipb.Actor) bool) (*ateapipb.ActorTemplate, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("beginning actor template delete mark: %w", err)
 	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	tmpl, _, err := lockActorTemplateForDelete(ctx, tx, templateRef, precondition)
+	if err != nil {
+		return nil, err
+	}
+	if blocks != nil {
+		inUse, err := blockingActors(ctx, tx, tmpl, blocks)
+		if err != nil {
+			return nil, err
+		}
+		if inUse != nil {
+			return nil, inUse
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE actor_templates SET deleting = true
+		WHERE atespace = $1 AND name = $2`, templateRef.Atespace, templateRef.Name); err != nil {
+		return nil, fmt.Errorf("marking actor template %s deleting: %w", templateRef, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("committing actor template delete mark %s: %w", templateRef, err)
+	}
+	return tmpl, nil
+}
+
+func (p *Persistence) DeleteActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef, precondition store.DeletePreconditions) (*ateapipb.ActorTemplate, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("beginning actor template delete: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	tmpl, deleting, err := lockActorTemplateForDelete(ctx, tx, templateRef, precondition)
+	if err != nil {
+		return nil, err
+	}
+	if !deleting {
+		return nil, fmt.Errorf("actor template %s is not marked deleting: %w", templateRef, store.ErrFailedPrecondition)
+	}
+	commandTag, err := tx.Exec(ctx, `
+		DELETE FROM actor_templates
+		WHERE atespace = $1 AND name = $2`, templateRef.Atespace, templateRef.Name)
 	if err != nil {
 		return nil, fmt.Errorf("deleting actor template %s: %w", templateRef, err)
 	}
-	out := &ateapipb.ActorTemplate{}
-	if err := unmarshalStored(protoBytes, out); err != nil {
-		return nil, fmt.Errorf("unmarshaling deleted actor template: %w", err)
+	if commandTag.RowsAffected() != 1 {
+		return nil, fmt.Errorf("deleting locked actor template %s affected %d rows, want 1", templateRef, commandTag.RowsAffected())
 	}
-	return out, nil
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("committing actor template delete %s: %w", templateRef, err)
+	}
+	return tmpl, nil
+}
+
+// lockActorTemplateForDelete reads the template FOR UPDATE in tx, checks
+// precondition against it, and reports whether it is marked deleting.
+func lockActorTemplateForDelete(ctx context.Context, tx pgx.Tx, templateRef resources.ActorTemplateRef, precondition store.DeletePreconditions) (*ateapipb.ActorTemplate, bool, error) {
+	var uid string
+	var version int64
+	var protoBytes []byte
+	var deleting bool
+	err := tx.QueryRow(ctx, `
+		SELECT uid, version, proto, deleting FROM actor_templates
+		WHERE atespace = $1 AND name = $2
+		FOR UPDATE`, templateRef.Atespace, templateRef.Name).Scan(&uid, &version, &protoBytes, &deleting)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("locking actor template %s for delete: %w", templateRef, err)
+	}
+	tmpl := &ateapipb.ActorTemplate{}
+	if err := unmarshalStored(protoBytes, tmpl); err != nil {
+		return nil, false, fmt.Errorf("unmarshaling actor template for delete: %w", err)
+	}
+	if err := validateProtoMetadataMatchesColumns("actor template "+templateRef.String(), tmpl.GetMetadata(), uid, version); err != nil {
+		return nil, false, err
+	}
+	if err := precondition.Check(tmpl.GetMetadata()); err != nil {
+		return nil, false, err
+	}
+	return tmpl, deleting, nil
+}
+
+// blockingActorsPageSize is how many actors blockingActors reads per query.
+const blockingActorsPageSize = 500
+
+// blockingActors pages through every stored actor and returns the ones blocks
+// reports, or nil if there are none: it names a few in the template's
+// atespace and counts the rest. It pages with the global actor list, which
+// already reads every partition.
+//
+// TODO: this reads and unmarshals every actor in every atespace while the
+// template row is locked, so a template delete costs O(all actors) and holds
+// off creates from that template for as long. Indexed columns for an actor's
+// template and borrowed snapshot URI would make it a bounded lookup.
+func blockingActors(ctx context.Context, tx pgx.Tx, tmpl *ateapipb.ActorTemplate, blocks func(*ateapipb.ActorTemplate, *ateapipb.Actor) bool) (*store.ActorTemplateInUseError, error) {
+	atespace := tmpl.GetMetadata().GetAtespace()
+	var inUse store.ActorTemplateInUseError
+	found := false
+	pageToken := ""
+	for {
+		actors, next, err := listActorsGlobal(ctx, tx, blockingActorsPageSize, pageToken)
+		if err != nil {
+			return nil, fmt.Errorf("listing actors that may use actor template: %w", err)
+		}
+		for _, actor := range actors {
+			if !blocks(tmpl, actor) {
+				continue
+			}
+			found = true
+			switch {
+			case actor.GetMetadata().GetAtespace() != atespace:
+				inUse.OtherAtespaces++
+			case len(inUse.Actors) == maxBlockingActors:
+				inUse.More = true
+			default:
+				inUse.Actors = append(inUse.Actors, resources.ActorRefFromActor(actor))
+			}
+		}
+		if next == "" {
+			break
+		}
+		pageToken = next
+	}
+	if !found {
+		return nil, nil
+	}
+	return &inUse, nil
 }

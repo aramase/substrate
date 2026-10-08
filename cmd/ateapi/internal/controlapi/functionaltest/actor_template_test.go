@@ -16,6 +16,8 @@ package functionaltest
 
 import (
 	"context"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -281,4 +283,268 @@ func TestDeleteActorTemplate_Preconditions(t *testing.T) {
 	}
 	_, err := tc.client.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{ActorTemplate: ref})
 	assertGrpcError(t, err, codes.NotFound, "ActorTemplate "+templateRef.String()+" not found")
+}
+
+// buildGoldenTemplate creates a template and runs the reconciler until its
+// golden tag is ready. It returns the template as stored then, and the golden
+// tag.
+func buildGoldenTemplate(t *testing.T, ctx context.Context, tc *testContext, ns string) (*ateapipb.ActorTemplate, *ateapipb.Tag) {
+	t.Helper()
+	createWorkerPool(t, tc, ns, "pool1", map[string]string{poolLabelKey: ns})
+	created := createTemplateWithSelector(t, tc, "golden-template", &ateapipb.Selector{MatchLabels: map[string]string{poolLabelKey: ns}})
+	createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
+	templateRef := resources.ActorTemplateRefFromActorTemplate(created).ToObjectRef()
+	controlapi.NewActorTemplateReconciler(tc.persistence, tc.service, 7*time.Second).Start(ctx)
+	var tmpl *ateapipb.ActorTemplate
+	err := wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		var err error
+		tmpl, err = tc.client.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{ActorTemplate: templateRef})
+		return tmpl.GetStatus().GetGoldenSnapshotStatus().GetGoldenTag() != nil, err
+	})
+	if err != nil {
+		t.Fatalf("waiting for golden tag: %v", err)
+	}
+	golden, err := tc.client.GetTag(ctx, &ateapipb.GetTagRequest{Tag: tmpl.GetStatus().GetGoldenSnapshotStatus().GetGoldenTag()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSnapshotPresent(t, tc, golden.GetStatus().GetSnapshot().GetSnapshotUri())
+	return tmpl, golden
+}
+
+// TestDeleteActorTemplate_RefusedWhileActorsExist checks that a template with
+// actors in any atespace is not deleted, that the refusal leaves the template
+// and its golden tag and snapshot alone, and that the delete collects them
+// once the actors are gone.
+func TestDeleteActorTemplate_RefusedWhileActorsExist(t *testing.T) {
+	ns := namespaceForTest("tmpl-in-use")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	tmpl, golden := buildGoldenTemplate(t, ctx, tc, ns)
+	templateRef := resources.ActorTemplateRefFromActorTemplate(tmpl).ToObjectRef()
+	goldenURI := golden.GetStatus().GetSnapshot().GetSnapshotUri()
+
+	const otherAtespace = "team-b"
+	if _, err := tc.client.CreateAtespace(ctx, &ateapipb.CreateAtespaceRequest{Atespace: &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: otherAtespace}}}); err != nil {
+		t.Fatal(err)
+	}
+	users := []resources.ActorRef{{Atespace: testAtespace, Name: "local"}, {Atespace: otherAtespace, Name: "remote"}}
+	for _, ref := range users {
+		if _, err := tc.client.CreateActor(ctx, &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+			Metadata: &ateapipb.ResourceMetadata{Atespace: ref.Atespace, Name: ref.Name}, ActorTemplate: templateRef,
+		}}); err != nil {
+			t.Fatalf("CreateActor(%s): %v", ref, err)
+		}
+	}
+
+	_, err := tc.client.DeleteActorTemplate(ctx, &ateapipb.DeleteActorTemplateRequest{ActorTemplate: templateRef})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("DeleteActorTemplate with actors = %v, want code FailedPrecondition", err)
+	}
+	// The template's own atespace is named; the other atespace's actor is
+	// only counted, since deleting the template grants no read on it.
+	msg := status.Convert(err).Message()
+	if want := "in use by actors " + users[0].String() + ", and by 1 actor in another atespace;"; !strings.Contains(msg, want) {
+		t.Errorf("DeleteActorTemplate error %q does not contain %q", msg, want)
+	}
+	if strings.Contains(msg, users[1].Name) {
+		t.Errorf("DeleteActorTemplate error %q names %s, an actor outside the template's atespace", msg, users[1])
+	}
+	after, err := tc.client.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{ActorTemplate: templateRef})
+	if err != nil {
+		t.Fatalf("GetActorTemplate after the refused delete: %v", err)
+	}
+	if diff := cmp.Diff(tmpl, after, protocmp.Transform()); diff != "" {
+		t.Errorf("template changed by the refused delete (-before +after):\n%s", diff)
+	}
+	if _, err := tc.client.GetTag(ctx, &ateapipb.GetTagRequest{Tag: resources.TagRefFromTag(golden).ToObjectRef()}); err != nil {
+		t.Errorf("golden tag after the refused delete: %v", err)
+	}
+	assertSnapshotPresent(t, tc, goldenURI)
+
+	for _, ref := range users {
+		if _, err := tc.client.DeleteActor(ctx, &ateapipb.DeleteActorRequest{Actor: ref.ToObjectRef()}); err != nil {
+			t.Fatalf("DeleteActor(%s): %v", ref, err)
+		}
+	}
+	if _, err := tc.client.DeleteActorTemplate(ctx, &ateapipb.DeleteActorTemplateRequest{ActorTemplate: templateRef}); err != nil {
+		t.Fatalf("DeleteActorTemplate once its actors are gone: %v", err)
+	}
+	if _, err := tc.client.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{ActorTemplate: templateRef}); status.Code(err) != codes.NotFound {
+		t.Errorf("GetActorTemplate after delete = %v, want NotFound", err)
+	}
+	if _, err := tc.client.GetTag(ctx, &ateapipb.GetTagRequest{Tag: resources.TagRefFromTag(golden).ToObjectRef()}); status.Code(err) != codes.NotFound {
+		t.Errorf("golden tag after delete = %v, want NotFound", err)
+	}
+	assertSnapshotCollected(t, tc, goldenURI)
+}
+
+// TestDeleteActorTemplate_ConcurrentCreateActor creates an actor from the
+// template while the delete is collecting the golden snapshot. Either the
+// create fails, or it lands first and the delete is refused; it must never
+// leave an actor naming a deleted template.
+func TestDeleteActorTemplate_ConcurrentCreateActor(t *testing.T) {
+	ns := namespaceForTest("tmpl-delete-race")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	tmpl, golden := buildGoldenTemplate(t, ctx, tc, ns)
+	templateRef := resources.ActorTemplateRefFromActorTemplate(tmpl).ToObjectRef()
+	actorRef := &ateapipb.ObjectRef{Atespace: testAtespace, Name: "racer"}
+
+	createErr := make(chan error, 1)
+	// The hook runs on the server's goroutine.
+	var started atomic.Bool
+	tc.objectStore.OnDelete = func(_, key string) error {
+		if !strings.Contains(key, "/tags/") || started.Swap(true) {
+			return nil
+		}
+		go func() {
+			_, err := tc.client.CreateActor(context.WithoutCancel(ctx), &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+				Metadata: &ateapipb.ResourceMetadata{Atespace: actorRef.GetAtespace(), Name: actorRef.GetName()}, ActorTemplate: templateRef,
+			}})
+			createErr <- err
+		}()
+		// Give the create time to finish if nothing holds it back.
+		select {
+		case err := <-createErr:
+			createErr <- err
+		case <-time.After(2 * time.Second):
+		}
+		return nil
+	}
+
+	_, deleteErr := tc.client.DeleteActorTemplate(ctx, &ateapipb.DeleteActorTemplateRequest{ActorTemplate: templateRef})
+	if !started.Load() {
+		t.Fatalf("the delete never collected the golden snapshot: %v", deleteErr)
+	}
+	var err error
+	select {
+	case err = <-createErr:
+	case <-time.After(30 * time.Second):
+		t.Fatal("CreateActor did not return after the delete")
+	}
+	if deleteErr != nil {
+		t.Fatalf("DeleteActorTemplate: %v", deleteErr)
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("CreateActor during the delete = %v, want code FailedPrecondition", err)
+	}
+	if _, err := tc.client.GetActor(ctx, &ateapipb.GetActorRequest{Actor: actorRef}); status.Code(err) != codes.NotFound {
+		t.Errorf("GetActor after the delete = %v, want NotFound", err)
+	}
+	if _, err := tc.client.GetTag(ctx, &ateapipb.GetTagRequest{Tag: resources.TagRefFromTag(golden).ToObjectRef()}); status.Code(err) != codes.NotFound {
+		t.Errorf("golden tag after delete = %v, want NotFound", err)
+	}
+}
+
+// TestDeleteActorTemplate_RepointedActorBorrowingGolden follows the recovery
+// the refusal names for an actor that was never resumed: it still borrows the
+// golden snapshot after a repoint, and a suspend alone does not release it,
+// since SuspendActor on a suspended actor changes nothing. Resuming it on the
+// new template and suspending it once moves it to a snapshot of its own, and
+// then the delete goes through and the actor still resumes.
+func TestDeleteActorTemplate_RepointedActorBorrowingGolden(t *testing.T) {
+	ns := namespaceForTest("tmpl-repoint")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	tmpl, golden := buildGoldenTemplate(t, ctx, tc, ns)
+	templateRef := resources.ActorTemplateRefFromActorTemplate(tmpl).ToObjectRef()
+	goldenURI := golden.GetStatus().GetSnapshot().GetSnapshotUri()
+
+	// waitForIdleWorker waits for the pool's one worker to host nothing, so a
+	// resume has somewhere to go.
+	waitForIdleWorker := func() {
+		t.Helper()
+		err := wait.PollUntilContextTimeout(ctx, 10*time.Millisecond, 30*time.Second, true, func(context.Context) (bool, error) {
+			workers, err := tc.workerCache.Workers()
+			if err != nil || len(workers) != 1 {
+				return false, nil
+			}
+			w := workers[0]
+			return w.GetStatus().GetState() == ateapipb.WorkerState_WORKER_STATE_ACTIVE && w.GetStatus().GetAllocated().GetActors() == 0, nil
+		})
+		if err != nil {
+			t.Fatalf("waiting for an idle worker: %v", err)
+		}
+	}
+
+	// The replacement runs on the same pool. Its own golden build uses the
+	// worker, so wait for it before resuming anything there.
+	replacement := createTemplateWithSelector(t, tc, "replacement", &ateapipb.Selector{MatchLabels: map[string]string{poolLabelKey: ns}})
+	replacementRef := resources.ActorTemplateRefFromActorTemplate(replacement).ToObjectRef()
+	err := wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		got, err := tc.client.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{ActorTemplate: replacementRef})
+		return got.GetStatus().GetGoldenSnapshotStatus().GetGoldenTag() != nil, err
+	})
+	if err != nil {
+		t.Fatalf("waiting for the replacement's golden tag: %v", err)
+	}
+	waitForIdleWorker()
+
+	actorRef := &ateapipb.ObjectRef{Atespace: testAtespace, Name: "borrower"}
+	created, err := tc.client.CreateActor(ctx, &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Atespace: actorRef.GetAtespace(), Name: actorRef.GetName()}, ActorTemplate: templateRef,
+	}})
+	if err != nil {
+		t.Fatalf("CreateActor: %v", err)
+	}
+	if got := created.GetStatus().GetExternalSnapshot().GetSnapshotUri(); got != goldenURI {
+		t.Fatalf("new actor's external snapshot = %q, want the golden %q", got, goldenURI)
+	}
+	if _, err := tc.client.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: &ateapipb.Actor{
+		Metadata: created.GetMetadata(), ActorTemplate: replacementRef,
+	}}); err != nil {
+		t.Fatalf("UpdateActor repointing at the replacement: %v", err)
+	}
+
+	assertRefused := func(when string) {
+		t.Helper()
+		_, err := tc.client.DeleteActorTemplate(ctx, &ateapipb.DeleteActorTemplateRequest{ActorTemplate: templateRef})
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("DeleteActorTemplate %s = %v, want code FailedPrecondition", when, err)
+		}
+		if want := "resume and suspend them once"; !strings.Contains(status.Convert(err).Message(), want) {
+			t.Errorf("DeleteActorTemplate %s error %q does not contain %q", when, status.Convert(err).Message(), want)
+		}
+		assertSnapshotPresent(t, tc, goldenURI)
+	}
+	assertRefused("after the repoint")
+	suspended, err := tc.client.SuspendActor(ctx, &ateapipb.SuspendActorRequest{Actor: actorRef})
+	if err != nil {
+		t.Fatalf("SuspendActor of the suspended actor: %v", err)
+	}
+	if got := suspended.GetActor().GetStatus().GetExternalSnapshot().GetSnapshotUri(); got != goldenURI {
+		t.Fatalf("external snapshot after a suspend without a resume = %q, want the golden %q still", got, goldenURI)
+	}
+	assertRefused("after a suspend without a resume")
+
+	if _, err := tc.client.ResumeActor(ctx, &ateapipb.ResumeActorRequest{Actor: actorRef}); err != nil {
+		t.Fatalf("ResumeActor on the replacement: %v", err)
+	}
+	suspended, err = tc.client.SuspendActor(ctx, &ateapipb.SuspendActorRequest{Actor: actorRef})
+	if err != nil {
+		t.Fatalf("SuspendActor after the resume: %v", err)
+	}
+	ownURI := suspended.GetActor().GetStatus().GetExternalSnapshot().GetSnapshotUri()
+	assertSnapshotOwnedByActor(t, suspended.GetActor(), ownURI)
+
+	if _, err := tc.client.DeleteActorTemplate(ctx, &ateapipb.DeleteActorTemplateRequest{ActorTemplate: templateRef}); err != nil {
+		t.Fatalf("DeleteActorTemplate once the actor has a snapshot of its own: %v", err)
+	}
+	assertSnapshotCollected(t, tc, goldenURI)
+	assertSnapshotPresent(t, tc, ownURI)
+	waitForIdleWorker()
+	resumed, err := tc.client.ResumeActor(ctx, &ateapipb.ResumeActorRequest{Actor: actorRef})
+	if err != nil {
+		t.Fatalf("ResumeActor after the old template's delete: %v", err)
+	}
+	if got := resumed.GetActor().GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_RUNNING {
+		t.Errorf("actor state after the resume = %v, want RUNNING", got)
+	}
 }

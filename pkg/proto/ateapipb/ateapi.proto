@@ -141,7 +141,9 @@ service Control {
   rpc ListActorTemplates(ListActorTemplatesRequest) returns (ListActorTemplatesResponse) {}
 
   // Delete an ActorTemplate together with its golden actor and golden
-  // tag in the reserved ate-golden atespace.
+  // tag in the reserved ate-golden atespace. Fails with FAILED_PRECONDITION,
+  // changing nothing, while any actor names the template or still borrows
+  // its golden snapshot.
   rpc DeleteActorTemplate(DeleteActorTemplateRequest) returns (ActorTemplate) {}
 
   // Get the deployment-wide global access policy singleton. Returns NotFound

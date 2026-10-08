@@ -29,6 +29,8 @@ func TestUpdateActor_ConcurrentWriteReturnsConflict(t *testing.T) {
 	s := setupPostgresPersistence(t)
 	ctx := context.Background()
 	createTestAtespace(t, s, "team-a")
+	createTestAtespace(t, s, "default")
+	createTestActorTemplate(t, s, "default", "template-a")
 	created, err := s.CreateActor(ctx, &ateapipb.Actor{
 		Metadata:      &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "actor-a"},
 		ActorTemplate: &ateapipb.ObjectRef{Atespace: "default", Name: "template-a"},
@@ -79,6 +81,8 @@ func TestUpdateActor_ConcurrentWriteReturnsConflict(t *testing.T) {
 func TestCreateActor_MissingAtespace_FailedPrecondition(t *testing.T) {
 	s := setupPostgresPersistence(t)
 	ctx := context.Background()
+	createTestAtespace(t, s, "ns1")
+	createTestActorTemplate(t, s, "ns1", "tmpl1")
 
 	actor := &ateapipb.Actor{
 		Metadata:      &ateapipb.ResourceMetadata{Name: "id1", Atespace: "no-such-atespace"},

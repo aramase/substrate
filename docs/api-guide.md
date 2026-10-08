@@ -465,7 +465,7 @@ When an `ActorTemplate` is created:
 3. It creates a published tag named after the template UID, copying the snapshot into tag-owned storage.
 4. It deletes the golden actor and records the tag reference in the template status.
 
-`CreateActor` uses an explicit `sourceTag` when supplied; otherwise it resolves the template's golden tag and records that snapshot on the new actor. If the golden tag is not ready yet, the actor starts without a snapshot and cold-boots even if the tag becomes ready before its first resume. The default does not populate the caller-owned `sourceTag` field. Deleting the template collects its golden tag and any unfinished golden actor.
+`CreateActor` uses an explicit `sourceTag` when supplied; otherwise it resolves the template's golden tag and records that snapshot on the new actor. If the golden tag is not ready yet, the actor starts without a snapshot and cold-boots even if the tag becomes ready before its first resume. The default does not populate the caller-owned `sourceTag` field. Deleting the template collects its golden tag and any unfinished golden actor, so it is refused while actors still use the template; see [`DeleteActorTemplate`](#deleteactortemplate).
 
 ### Resumption Lifecycle
 Once a template is `Ready`, creating an actor logically (via `kubectl ate create actor`) allows it to be resumed instantly on any free worker in the referenced `WorkerPool`. Substrate bypasses the standard container boot and restores the process directly from its last saved state.
@@ -475,7 +475,7 @@ Once a template is `Ready`, creating an actor logically (via `kubectl ate create
 ## 5. Best Practices
 *   **Startup Logic:** Place expensive initialization (loading large models, establishing baseline connections) in your application's entry point. These will be captured in the Golden Snapshot and won't need to be repeated on every resumption.
 *   **Placement:** Ensure your `ActorTemplate`'s `sandboxClass` matches your `WorkerPool`'s `sandboxClasses[].name`, and use the template's `workerSelector` to target specific pools — pool selection is by label match, not by namespace or RBAC.
-*   **Version Management:** When updating code, create a new `ActorTemplate` (e.g. `v2`). Substrate treats each template as an immutable state root.
+*   **Version Management:** When updating code, create a new `ActorTemplate` (e.g. `v2`). Substrate treats each template as an immutable state root. Delete the old template only once its actors are deleted or repointed to the new one and then resumed and suspended there once.
 *   **Eviction:** When its worker pod is evicted, an actor gets `SIGTERM` and 30 minutes to be suspended. After that it is killed and moves to `ACTOR_STATE_CRASHED`, and everything since its last snapshot is lost. So an actor that runs for more than 30 minutes without a suspend can lose data. A `CRASHED` actor can be recovered back to `ACTOR_STATE_SUSPENDED` at its last external snapshot using `RevertActor` (`kubectl ate revert`).
 
 ---
@@ -547,6 +547,16 @@ Removes an actor from the registry and cleans up associated resources.
     *   `any_state`: (Optional) If `true`, allows deleting the actor from any state (e.g. `RUNNING`, `PAUSED`), terminating active workloads, detaching volumes, and releasing worker allocations. By default (`false`), only actors in `ACTOR_STATE_SUSPENDED` or `ACTOR_STATE_CRASHED` (or already `ACTOR_STATE_DELETING`) can be deleted.
 *   **Response:** the deleted `Actor`, as it was immediately before removal.
 *   Deleting an actor also deletes the external snapshot it owns, along with one an interrupted suspend left behind. Snapshots it only borrows from a tag are left alone, and its tags are unaffected — they hold their own copies.
+
+#### `DeleteActorTemplate`
+Removes an `ActorTemplate` together with its golden actor and golden tag in `ate-golden`, and the golden snapshot that tag holds.
+*   **Request:** `DeleteActorTemplateRequest`
+    *   `actor_template`: `ObjectRef` of the template to delete.
+    *   `options`: (Optional) `DeleteOptions`. `uid` and `version` are preconditions checked against the template: a mismatch returns `ABORTED` and deletes nothing.
+*   **Response:** the deleted `ActorTemplate`, as it was immediately before removal.
+*   **Errors:** `FAILED_PRECONDITION` while any actor, in any atespace and any state, names the template in `actor_template`, or still borrows the golden snapshot (`status.externalSnapshot.snapshotUri` is the golden tag's; an actor repointed elsewhere keeps borrowing it until it is resumed and then suspended, since `SuspendActor` on a suspended actor takes no snapshot). The message names up to five of those actors in the template's own atespace and only counts the ones in other atespaces, because permission to delete a template does not include reading actors in the atespaces that use it. A refused delete changes nothing. Delete those actors, or repoint them to another template, then resume and suspend them once, and retry. There is no force option: deleting the golden snapshot under those actors would leave them unable to resume.
+*   Once the check passes, the template is marked as being deleted. From then on, creating an actor from it or repointing an actor at it fails with `FAILED_PRECONDITION`. A create or repoint that races with the check either lands first, and the check refuses the delete, or waits for the mark and then fails.
+*   The golden actor and tag are removed after the mark and before the template. A delete that fails part-way leaves the template marked, still refusing new actors, for a retry with the same arguments to finish the cleanup.
 
 #### `GetActor` / `ListActors`
 Query the state of logical actors.

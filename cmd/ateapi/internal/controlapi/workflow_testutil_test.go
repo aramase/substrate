@@ -144,7 +144,15 @@ func seedWorkflowActor(t *testing.T, ctx context.Context, st store.Interface, ac
 	for _, opt := range opts {
 		opt(actor)
 	}
-	storetest.MustCreateActor(t, ctx, st, actor)
+	// The store refuses to create an actor whose snapshot was taken under a
+	// template other than the one it names, a state only a repoint reaches, so
+	// the snapshot is attached after the create.
+	ext := actor.GetStatus().GetExternalSnapshot()
+	actor.Status.ExternalSnapshot = nil
+	created := storetest.MustCreateActor(t, ctx, st, actor)
+	if ext != nil {
+		mustUpdateActorStatus(t, ctx, st, created, func(s *ateapipb.ActorStatus) { s.ExternalSnapshot = ext })
+	}
 }
 
 // allActorStates enumerates every ActorState value, for exhaustive
@@ -179,5 +187,17 @@ func assertPrerequisiteResult(t *testing.T, st ateapipb.ActorState, err error, w
 	}
 	if got := apierror.Code(err); got != codes.FailedPrecondition {
 		t.Errorf("state %v: status.Code = %v, want %v", st, got, codes.FailedPrecondition)
+	}
+}
+
+// mustRemoveActorTemplate removes templateRef from the store without the
+// in-use check or golden cleanup DeleteActorTemplate does.
+func mustRemoveActorTemplate(t *testing.T, ctx context.Context, st store.Interface, templateRef resources.ActorTemplateRef) {
+	t.Helper()
+	if _, err := st.MarkActorTemplateDeleting(ctx, templateRef, store.DeletePreconditions{}, nil); err != nil {
+		t.Fatalf("MarkActorTemplateDeleting(%s): %v", templateRef, err)
+	}
+	if _, err := st.DeleteActorTemplate(ctx, templateRef, store.DeletePreconditions{}); err != nil {
+		t.Fatalf("DeleteActorTemplate(%s): %v", templateRef, err)
 	}
 }

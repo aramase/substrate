@@ -149,7 +149,10 @@ var deleteActorTemplateCmd = &cobra.Command{
 	Short: "Delete an actor template",
 	Long: `Delete an actor template.
 
-The server also deletes the template's golden actor and golden snapshot.`,
+The server also deletes the template's golden actor and golden snapshot.
+It refuses, changing nothing, while any actor still uses the template;
+delete those actors, or repoint them to another template, then resume and
+suspend them once, and retry.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()

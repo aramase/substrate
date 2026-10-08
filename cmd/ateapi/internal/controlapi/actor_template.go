@@ -127,6 +127,10 @@ func (s *RPCService) DeleteActorTemplate(ctx context.Context, req *ateapipb.Dele
 	return s.actorWorkflow.DeleteActorTemplate(ctx, resources.ActorTemplateRefFromObjectRef(req.GetActorTemplate()), toDeletePreconditions(req.GetOptions()))
 }
 
+func (s *ServiceImpl) MarkActorTemplateDeleting(ctx context.Context, templateRef resources.ActorTemplateRef, precondition store.DeletePreconditions, blocks func(*ateapipb.ActorTemplate, *ateapipb.Actor) bool) (*ateapipb.ActorTemplate, error) {
+	return s.store.MarkActorTemplateDeleting(ctx, templateRef, precondition, blocks)
+}
+
 func (s *ServiceImpl) DeleteActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef, precondition store.DeletePreconditions) (*ateapipb.ActorTemplate, error) {
 	// TODO: implement this
 	return s.store.DeleteActorTemplate(ctx, templateRef, precondition)

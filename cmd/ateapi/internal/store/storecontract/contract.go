@@ -134,6 +134,28 @@ func newTestWorker(name, pod string) *ateapipb.Worker {
 	}
 }
 
+// testActorTemplateRefs are the ActorTemplates the test actors name.
+var testActorTemplateRefs = []resources.ActorTemplateRef{
+	{Atespace: "ns1", Name: "tmpl1"},
+	{Atespace: "default", Name: "test-template"},
+}
+
+// setupWithActorTemplates runs setup and stores testActorTemplateRefs, since
+// the store refuses an actor that names a missing template.
+func setupWithActorTemplates(t *testing.T, setup func(t *testing.T) store.Interface) store.Interface {
+	t.Helper()
+	s := setup(t)
+	for _, ref := range testActorTemplateRefs {
+		mustCreateAtespace(t, s, ref.Atespace)
+		if _, err := s.CreateActorTemplate(context.Background(), &ateapipb.ActorTemplate{
+			Metadata: &ateapipb.ResourceMetadata{Atespace: ref.Atespace, Name: ref.Name},
+		}); err != nil {
+			t.Fatalf("CreateActorTemplate(%s) failed: %v", ref, err)
+		}
+	}
+	return s
+}
+
 // mustCreateAtespace creates the atespace an actor test is about to populate.
 // The PostgreSQL store enforces the actor->atespace foreign key.
 func mustCreateAtespace(t *testing.T, s store.Interface, name string) {
@@ -278,7 +300,7 @@ func runEgressPolicyContractTests(t *testing.T, setup func(t *testing.T) store.I
 	})
 
 	t.Run("EgressPolicy_DeletePreconditions", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		mustCreateAtespace(t, s, testAtespace)
 		actorRef := resources.ActorRef{Atespace: testAtespace, Name: "session-1"}
@@ -445,7 +467,7 @@ func runActorContractTests(t *testing.T, setup func(t *testing.T) store.Interfac
 	})
 
 	t.Run("CreateActor_Success", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		mustCreateAtespace(t, s, testAtespace)
 
@@ -490,7 +512,7 @@ func runActorContractTests(t *testing.T, setup func(t *testing.T) store.Interfac
 	})
 
 	t.Run("CreateActor_AlreadyExists", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		mustCreateAtespace(t, s, testAtespace)
 
@@ -509,7 +531,7 @@ func runActorContractTests(t *testing.T, setup func(t *testing.T) store.Interfac
 	})
 
 	t.Run("UpdateActor_Success", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		mustCreateAtespace(t, s, testAtespace)
 
@@ -565,7 +587,7 @@ func runActorContractTests(t *testing.T, setup func(t *testing.T) store.Interfac
 	})
 
 	t.Run("UpdateActor_Conflict", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		mustCreateAtespace(t, s, testAtespace)
 
@@ -606,7 +628,7 @@ func runActorContractTests(t *testing.T, setup func(t *testing.T) store.Interfac
 	})
 
 	t.Run("UpdateActor_UIDConflict", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		mustCreateAtespace(t, s, testAtespace)
 
@@ -661,7 +683,7 @@ func runActorContractTests(t *testing.T, setup func(t *testing.T) store.Interfac
 	})
 
 	t.Run("UpdateActor_MutateError", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		mustCreateAtespace(t, s, testAtespace)
 
@@ -692,7 +714,7 @@ func runActorContractTests(t *testing.T, setup func(t *testing.T) store.Interfac
 	})
 
 	t.Run("UpdateActor_MissingPrecondition", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		mustCreateAtespace(t, s, testAtespace)
 
@@ -752,7 +774,7 @@ func runActorContractTests(t *testing.T, setup func(t *testing.T) store.Interfac
 			ateapipb.ActorState_ACTOR_STATE_PAUSED,
 		} {
 			t.Run(state.String(), func(t *testing.T) {
-				s := setup(t)
+				s := setupWithActorTemplates(t, setup)
 				ctx := context.Background()
 				mustCreateAtespace(t, s, testAtespace)
 
@@ -789,7 +811,7 @@ func runActorContractTests(t *testing.T, setup func(t *testing.T) store.Interfac
 	})
 
 	t.Run("DeleteActor_Preconditions", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		mustCreateAtespace(t, s, testAtespace)
 		actorRef := resources.ActorRef{Atespace: testAtespace, Name: "session-1"}
@@ -857,7 +879,7 @@ func runActorContractTests(t *testing.T, setup func(t *testing.T) store.Interfac
 	})
 
 	t.Run("ListActors", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		mustCreateAtespace(t, s, testAtespace)
 
@@ -898,7 +920,7 @@ func runActorContractTests(t *testing.T, setup func(t *testing.T) store.Interfac
 	})
 
 	t.Run("ListActors_Pagination", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		mustCreateAtespace(t, s, testAtespace)
 
@@ -940,7 +962,7 @@ func runActorContractTests(t *testing.T, setup func(t *testing.T) store.Interfac
 	})
 
 	t.Run("ListActors_ScopedByAtespace", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		mustCreateAtespace(t, s, "team-a")
 		mustCreateAtespace(t, s, "team-b")
@@ -1022,10 +1044,283 @@ func runActorTemplateContractTests(t *testing.T, setup func(t *testing.T) store.
 			t.Errorf("stored template mismatch (-created +got):\n%s", diff)
 		}
 
+		if _, err := s.MarkActorTemplateDeleting(ctx, templateRef, store.DeletePreconditions{}, nil); err != nil {
+			t.Fatalf("MarkActorTemplateDeleting failed: %v", err)
+		}
 		if _, err := s.DeleteActorTemplate(ctx, templateRef, store.DeletePreconditions{}); err != nil {
 			t.Fatalf("DeleteActorTemplate failed: %v", err)
 		}
 	})
+
+	// namesTemplate blocks the delete for every actor that names the template.
+	namesTemplate := func(tmpl *ateapipb.ActorTemplate, actor *ateapipb.Actor) bool {
+		return resources.ActorTemplateRefFromObjectRef(actor.GetActorTemplate()) == resources.ActorTemplateRefFromActorTemplate(tmpl)
+	}
+
+	t.Run("MarkActorTemplateDeleting_InUse", func(t *testing.T) {
+		s := setupWithActorTemplates(t, setup)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		templateRef := testActorTemplateRefs[0]
+		// The template's atespace holds 7 of its users and testAtespace 3.
+		const local, remote = 7, 3
+		var users, localUsers []resources.ActorRef
+		for i := range local + remote {
+			ref := resources.ActorRef{Atespace: templateRef.Atespace, Name: fmt.Sprintf("actor-%d", i)}
+			if i >= local {
+				ref.Atespace = testAtespace
+			}
+			if _, err := s.CreateActor(ctx, newTestSuspendedActor(ref.Atespace, ref.Name)); err != nil {
+				t.Fatalf("CreateActor(%s) failed: %v", ref, err)
+			}
+			users = append(users, ref)
+			if i < local {
+				localUsers = append(localUsers, ref)
+			}
+		}
+
+		_, err := s.MarkActorTemplateDeleting(ctx, templateRef, store.DeletePreconditions{}, namesTemplate)
+		var inUse *store.ActorTemplateInUseError
+		if !errors.As(err, &inUse) || !errors.Is(err, store.ErrFailedPrecondition) {
+			t.Fatalf("MarkActorTemplateDeleting while in use = %v, want *ActorTemplateInUseError matching ErrFailedPrecondition", err)
+		}
+		if len(inUse.Actors) == 0 || len(inUse.Actors) >= local || !inUse.More {
+			t.Errorf("in-use error names %v (more: %v) of %d actors in the template's atespace, want some and more", inUse.Actors, inUse.More, local)
+		}
+		// Actors in other atespaces are counted, never named.
+		for _, ref := range inUse.Actors {
+			if !slices.Contains(localUsers, ref) {
+				t.Errorf("in-use error names %s, want only users in the template's atespace %s", ref, templateRef.Atespace)
+			}
+		}
+		if inUse.OtherAtespaces != remote {
+			t.Errorf("in-use error counts %d actors in other atespaces, want %d", inUse.OtherAtespaces, remote)
+		}
+		// The refusal left the template unmarked: it still takes new actors
+		// and cannot be deleted.
+		late := newTestSuspendedActor(testAtespace, "late")
+		if _, err := s.CreateActor(ctx, late); err != nil {
+			t.Fatalf("CreateActor after the refused mark: %v", err)
+		}
+		users = append(users, resources.ActorRefFromActor(late))
+		if _, err := s.DeleteActorTemplate(ctx, templateRef, store.DeletePreconditions{}); !errors.Is(err, store.ErrFailedPrecondition) {
+			t.Errorf("DeleteActorTemplate after the refused mark = %v, want ErrFailedPrecondition", err)
+		}
+
+		for _, ref := range users {
+			if _, err := s.DeleteActor(ctx, ref, store.DeletePreconditions{}); err != nil {
+				t.Fatalf("DeleteActor(%s) failed: %v", ref, err)
+			}
+		}
+		if _, err := s.MarkActorTemplateDeleting(ctx, templateRef, store.DeletePreconditions{}, namesTemplate); err != nil {
+			t.Fatalf("MarkActorTemplateDeleting once unused: %v", err)
+		}
+		if _, err := s.DeleteActorTemplate(ctx, templateRef, store.DeletePreconditions{}); err != nil {
+			t.Fatalf("DeleteActorTemplate once marked: %v", err)
+		}
+		if _, err := s.GetActorTemplate(ctx, templateRef); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("GetActorTemplate after delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("DeleteActorTemplate_Unmarked", func(t *testing.T) {
+		s := setupWithActorTemplates(t, setup)
+		ctx := context.Background()
+		templateRef := testActorTemplateRefs[0]
+		if _, err := s.DeleteActorTemplate(ctx, templateRef, store.DeletePreconditions{}); !errors.Is(err, store.ErrFailedPrecondition) {
+			t.Fatalf("DeleteActorTemplate of an unmarked template = %v, want ErrFailedPrecondition", err)
+		}
+		if _, err := s.GetActorTemplate(ctx, templateRef); err != nil {
+			t.Fatalf("GetActorTemplate after the refused delete: %v", err)
+		}
+	})
+
+	t.Run("MarkActorTemplateDeleting_RefusesNewUsers", func(t *testing.T) {
+		s := setupWithActorTemplates(t, setup)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		templateRef := testActorTemplateRefs[0]
+		elsewhere := newTestSuspendedActor(testAtespace, "elsewhere")
+		elsewhere.ActorTemplate = testActorTemplateRefs[1].ToObjectRef()
+		elsewhere, err := s.CreateActor(ctx, elsewhere)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, err := s.GetActorTemplate(ctx, templateRef)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for range 2 {
+			marked, err := s.MarkActorTemplateDeleting(ctx, templateRef, store.DeletePreconditions{}, namesTemplate)
+			if err != nil {
+				t.Fatalf("MarkActorTemplateDeleting: %v", err)
+			}
+			if diff := cmp.Diff(before, marked, protocmp.Transform()); diff != "" {
+				t.Errorf("MarkActorTemplateDeleting returned a changed template (-before +marked):\n%s", diff)
+			}
+		}
+		if _, err := s.CreateActor(ctx, newTestSuspendedActor(testAtespace, "new")); !errors.Is(err, store.ErrActorTemplateDeleting) {
+			t.Errorf("CreateActor from a marked template = %v, want ErrActorTemplateDeleting", err)
+		}
+		_, err = s.UpdateActor(ctx, resources.ActorRefFromActor(elsewhere), store.PreconditionFrom(elsewhere), func(a *ateapipb.Actor) error {
+			a.ActorTemplate = templateRef.ToObjectRef()
+			return nil
+		})
+		if !errors.Is(err, store.ErrActorTemplateDeleting) {
+			t.Errorf("UpdateActor repointing at a marked template = %v, want ErrActorTemplateDeleting", err)
+		}
+		if _, err := s.UpdateActor(ctx, resources.ActorRefFromActor(elsewhere), store.PreconditionFrom(elsewhere), func(a *ateapipb.Actor) error {
+			a.Status.State = ateapipb.ActorState_ACTOR_STATE_RUNNING
+			return nil
+		}); err != nil {
+			t.Errorf("UpdateActor that keeps its template: %v", err)
+		}
+		if _, err := s.DeleteActorTemplate(ctx, templateRef, store.DeletePreconditions{UID: before.GetMetadata().GetUid()}); err != nil {
+			t.Fatalf("DeleteActorTemplate once marked: %v", err)
+		}
+	})
+
+	t.Run("CreateActor_ActorTemplateNotFound", func(t *testing.T) {
+		s := setupWithActorTemplates(t, setup)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		missing := newTestSuspendedActor(testAtespace, "missing")
+		missing.ActorTemplate = &ateapipb.ObjectRef{Atespace: "ns1", Name: "no-such-template"}
+		if _, err := s.CreateActor(ctx, missing); !errors.Is(err, store.ErrActorTemplateNotFound) {
+			t.Errorf("CreateActor naming a missing template = %v, want ErrActorTemplateNotFound", err)
+		}
+
+		tmpl, err := s.GetActorTemplate(ctx, testActorTemplateRefs[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		replaced := newTestSuspendedActor(testAtespace, "replaced")
+		replaced.Status.ExternalSnapshot.ActorTemplateUid = "uid-of-a-deleted-incarnation"
+		if _, err := s.CreateActor(ctx, replaced); !errors.Is(err, store.ErrActorTemplateNotFound) {
+			t.Errorf("CreateActor with guest state from another template uid = %v, want ErrActorTemplateNotFound", err)
+		}
+		matching := newTestSuspendedActor(testAtespace, "matching")
+		matching.Status.ExternalSnapshot.ActorTemplateUid = tmpl.GetMetadata().GetUid()
+		if _, err := s.CreateActor(ctx, matching); err != nil {
+			t.Errorf("CreateActor with guest state from the template: %v", err)
+		}
+	})
+
+	t.Run("UpdateActor_RepointToMissingTemplate", func(t *testing.T) {
+		s := setupWithActorTemplates(t, setup)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		created, err := s.CreateActor(ctx, newTestSuspendedActor(testAtespace, "actor-1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref := resources.ActorRefFromActor(created)
+		_, err = s.UpdateActor(ctx, ref, store.PreconditionFrom(created), func(a *ateapipb.Actor) error {
+			a.ActorTemplate = &ateapipb.ObjectRef{Atespace: "ns1", Name: "no-such-template"}
+			return nil
+		})
+		if !errors.Is(err, store.ErrActorTemplateNotFound) {
+			t.Fatalf("UpdateActor repointing at a missing template = %v, want ErrActorTemplateNotFound", err)
+		}
+		other := testActorTemplateRefs[1]
+		updated, err := s.UpdateActor(ctx, ref, store.PreconditionFrom(created), func(a *ateapipb.Actor) error {
+			a.ActorTemplate = other.ToObjectRef()
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("UpdateActor repointing at %s: %v", other, err)
+		}
+		if got := resources.ActorTemplateRefFromObjectRef(updated.GetActorTemplate()); got != other {
+			t.Errorf("repointed actor names %s, want %s", got, other)
+		}
+	})
+
+	// While MarkActorTemplateDeleting is between its in-use check and the
+	// mark, an actor write that would start using the template must neither
+	// land unseen nor land on the marked template.
+	for _, write := range []struct {
+		name string
+		// prepare runs before the mark; write runs during it.
+		prepare func(t *testing.T, s store.Interface) func() error
+	}{{
+		name: "CreateActor",
+		prepare: func(t *testing.T, s store.Interface) func() error {
+			return func() error {
+				_, err := s.CreateActor(context.Background(), newTestSuspendedActor(testAtespace, "racer"))
+				return err
+			}
+		},
+	}, {
+		name: "UpdateActorRepoint",
+		prepare: func(t *testing.T, s store.Interface) func() error {
+			actor := newTestSuspendedActor(testAtespace, "racer")
+			actor.ActorTemplate = testActorTemplateRefs[1].ToObjectRef()
+			created, err := s.CreateActor(context.Background(), actor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return func() error {
+				_, err := s.UpdateActor(context.Background(), resources.ActorRefFromActor(created), store.PreconditionFrom(created), func(a *ateapipb.Actor) error {
+					a.ActorTemplate = testActorTemplateRefs[0].ToObjectRef()
+					return nil
+				})
+				return err
+			}
+		},
+	}} {
+		t.Run("MarkActorTemplateDeleting_Concurrent"+write.name, func(t *testing.T) {
+			s := setupWithActorTemplates(t, setup)
+			ctx := context.Background()
+			mustCreateAtespace(t, s, testAtespace)
+			racer := resources.ActorRef{Atespace: testAtespace, Name: "racer"}
+			templateRef := testActorTemplateRefs[0]
+			// The in-use check asks about every actor, so one that uses
+			// another template gives it something to ask about.
+			bystander := newTestSuspendedActor(testAtespace, "bystander")
+			bystander.ActorTemplate = testActorTemplateRefs[1].ToObjectRef()
+			if _, err := s.CreateActor(ctx, bystander); err != nil {
+				t.Fatal(err)
+			}
+			do := write.prepare(t, s)
+
+			writeErr := make(chan error, 1)
+			var started bool
+			blocks := func(tmpl *ateapipb.ActorTemplate, actor *ateapipb.Actor) bool {
+				if !started {
+					started = true
+					go func() { writeErr <- do() }()
+					select {
+					case err := <-writeErr:
+						t.Errorf("%s landed during the in-use check: %v", write.name, err)
+					case <-time.After(500 * time.Millisecond):
+					}
+				}
+				return namesTemplate(tmpl, actor)
+			}
+			if _, err := s.MarkActorTemplateDeleting(ctx, templateRef, store.DeletePreconditions{}, blocks); err != nil {
+				t.Fatalf("MarkActorTemplateDeleting: %v", err)
+			}
+			if !started {
+				t.Fatal("the in-use check asked about no actor")
+			}
+			select {
+			case err := <-writeErr:
+				if !errors.Is(err, store.ErrActorTemplateDeleting) {
+					t.Errorf("%s after the mark = %v, want ErrActorTemplateDeleting", write.name, err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatalf("%s did not return after the mark", write.name)
+			}
+			got, err := s.GetActor(ctx, racer)
+			if err == nil && resources.ActorTemplateRefFromObjectRef(got.GetActorTemplate()) == templateRef {
+				t.Errorf("actor %s names the marked template", racer)
+			}
+			if _, err := s.DeleteActorTemplate(ctx, templateRef, store.DeletePreconditions{}); err != nil {
+				t.Fatalf("DeleteActorTemplate: %v", err)
+			}
+		})
+	}
 
 	t.Run("DeleteActorTemplate_Preconditions", func(t *testing.T) {
 		s := setup(t)
@@ -1040,6 +1335,9 @@ func runActorTemplateContractTests(t *testing.T, setup func(t *testing.T) store.
 			return created
 		}
 		del := func(precondition store.DeletePreconditions) error {
+			if _, err := s.MarkActorTemplateDeleting(ctx, ref, precondition, nil); err != nil {
+				return err
+			}
 			_, err := s.DeleteActorTemplate(ctx, ref, precondition)
 			return err
 		}
@@ -1184,7 +1482,7 @@ func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface)
 	}
 
 	t.Run("Tag_Lifecycle", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		actor := seedSuspendedActor(t, s, "team-a", "actor-1")
 
@@ -1261,7 +1559,7 @@ func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface)
 	})
 
 	t.Run("DeleteTag_Preconditions", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		mustCreateAtespace(t, s, testAtespace)
 		actor, err := s.CreateActor(ctx, newTestSuspendedActor(testAtespace, "actor-1"))
@@ -1320,7 +1618,7 @@ func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface)
 	})
 
 	t.Run("Tag_ImmutableFields", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		actor := seedSuspendedActor(t, s, "team-a", "actor-1")
 		tag := storeTag(t, s, newTestInProgressTag("production", actor))
@@ -1377,7 +1675,7 @@ func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface)
 	})
 
 	t.Run("CreateTag_ReusedTagName", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		actor := seedSuspendedActor(t, s, "team-a", "actor-1")
 		tagInput := newTestInProgressTag("production", actor)
@@ -1401,7 +1699,7 @@ func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface)
 	})
 
 	t.Run("CreateTag_UnknownAtespace", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		actor := seedSuspendedActor(t, s, "team-a", "actor-1")
 
@@ -1413,7 +1711,7 @@ func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface)
 	})
 
 	t.Run("UpdateTag_MissingPrecondition", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		actor := seedSuspendedActor(t, s, "team-a", "actor-1")
 		created := storeTag(t, s, newTestInProgressTag("production", actor))
@@ -1450,7 +1748,7 @@ func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface)
 	})
 
 	t.Run("ListTags_PaginationAndScope", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		for _, atespace := range []string{"team-a", "team-b"} {
 			actor := seedSuspendedActor(t, s, atespace, "actor-1")
@@ -2893,7 +3191,7 @@ func runAtespaceContractTests(t *testing.T, setup func(t *testing.T) store.Inter
 	})
 
 	t.Run("DeleteAtespace_Preconditions", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		create := func() *ateapipb.Atespace {
 			created, err := s.CreateAtespace(ctx, newTestAtespace("team-a"))
@@ -3112,12 +3410,12 @@ func runUnknownFieldContractTests(t *testing.T, setup func(t *testing.T) store.I
 	t.Helper()
 
 	t.Run("UnknownFields_Actor", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		mustCreateAtespace(t, s, testAtespace)
 		created, err := s.CreateActor(ctx, withUnknownField(&ateapipb.Actor{
 			Metadata:      withUnknownField(&ateapipb.ResourceMetadata{Atespace: testAtespace, Name: "actor-1"}),
-			ActorTemplate: withUnknownField(&ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl-1"}),
+			ActorTemplate: withUnknownField(&ateapipb.ObjectRef{Atespace: "ns1", Name: "tmpl1"}),
 			Status:        withUnknownField(&ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_DELETING}),
 		}))
 		if err != nil {
@@ -3198,7 +3496,7 @@ func runUnknownFieldContractTests(t *testing.T, setup func(t *testing.T) store.I
 	})
 
 	t.Run("UnknownFields_Tag", func(t *testing.T) {
-		s := setup(t)
+		s := setupWithActorTemplates(t, setup)
 		ctx := context.Background()
 		mustCreateAtespace(t, s, testAtespace)
 		actor, err := s.CreateActor(ctx, newTestSuspendedActor(testAtespace, "actor-1"))
@@ -3306,6 +3604,11 @@ func runUnknownFieldContractTests(t *testing.T, setup func(t *testing.T) store.I
 		}
 		assertPruned(t, "UpdateActorTemplate", created, updated)
 
+		marked, err := s.MarkActorTemplateDeleting(ctx, ref, store.DeletePreconditions{}, nil)
+		if err != nil {
+			t.Fatalf("MarkActorTemplateDeleting failed: %v", err)
+		}
+		assertPruned(t, "MarkActorTemplateDeleting", created, marked)
 		deleted, err := s.DeleteActorTemplate(ctx, ref, store.DeletePreconditions{})
 		if err != nil {
 			t.Fatalf("DeleteActorTemplate failed: %v", err)

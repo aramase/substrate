@@ -168,7 +168,9 @@ type ControlClient interface {
 	GetActorTemplate(ctx context.Context, in *GetActorTemplateRequest, opts ...grpc.CallOption) (*ActorTemplate, error)
 	ListActorTemplates(ctx context.Context, in *ListActorTemplatesRequest, opts ...grpc.CallOption) (*ListActorTemplatesResponse, error)
 	// Delete an ActorTemplate together with its golden actor and golden
-	// tag in the reserved ate-golden atespace.
+	// tag in the reserved ate-golden atespace. Fails with FAILED_PRECONDITION,
+	// changing nothing, while any actor names the template or still borrows
+	// its golden snapshot.
 	DeleteActorTemplate(ctx context.Context, in *DeleteActorTemplateRequest, opts ...grpc.CallOption) (*ActorTemplate, error)
 	// Get the deployment-wide global access policy singleton. Returns NotFound
 	// until the policy has been created.
@@ -710,7 +712,9 @@ type ControlServer interface {
 	GetActorTemplate(context.Context, *GetActorTemplateRequest) (*ActorTemplate, error)
 	ListActorTemplates(context.Context, *ListActorTemplatesRequest) (*ListActorTemplatesResponse, error)
 	// Delete an ActorTemplate together with its golden actor and golden
-	// tag in the reserved ate-golden atespace.
+	// tag in the reserved ate-golden atespace. Fails with FAILED_PRECONDITION,
+	// changing nothing, while any actor names the template or still borrows
+	// its golden snapshot.
 	DeleteActorTemplate(context.Context, *DeleteActorTemplateRequest) (*ActorTemplate, error)
 	// Get the deployment-wide global access policy singleton. Returns NotFound
 	// until the policy has been created.

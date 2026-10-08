@@ -137,6 +137,7 @@ type serviceStore interface {
 	CreateActorTemplate(ctx context.Context, template *ateapipb.ActorTemplate) (*ateapipb.ActorTemplate, error)
 	GetActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef) (*ateapipb.ActorTemplate, error)
 	ListActorTemplates(ctx context.Context, atespace string, opts store.ListOptions) (store.ListResponse[*ateapipb.ActorTemplate], error)
+	MarkActorTemplateDeleting(ctx context.Context, templateRef resources.ActorTemplateRef, precondition store.DeletePreconditions, blocks func(*ateapipb.ActorTemplate, *ateapipb.Actor) bool) (*ateapipb.ActorTemplate, error)
 	DeleteActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef, precondition store.DeletePreconditions) (*ateapipb.ActorTemplate, error)
 	ListWorkers(ctx context.Context, opts store.ListOptions) (store.ListResponse[*ateapipb.Worker], error)
 	GetWorker(ctx context.Context, name string) (*ateapipb.Worker, error)

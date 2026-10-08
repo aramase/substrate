@@ -347,6 +347,8 @@ func TestUpdateActor_RepointTemplate(t *testing.T) {
 		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl-gone"},
 		Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
 	})
+	// An unguarded store delete leaves the actor naming a missing template.
+	mustRemoveActorTemplate(t, ctx, persistence, resources.ActorTemplateRef{Atespace: testAtespace, Name: "tmpl-gone"})
 	repointed, err := svc.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: &ateapipb.Actor{
 		Metadata:      orphan.GetMetadata(),
 		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl-e"},

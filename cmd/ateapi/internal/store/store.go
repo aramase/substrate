@@ -62,7 +62,40 @@ var (
 	// ErrImmutableField indicates an update's mutation changed a field that is
 	// immutable for the lifetime of the stored object.
 	ErrImmutableField = errors.New("persistence: immutable field")
+
+	// ErrActorTemplateNotFound indicates an actor write named an ActorTemplate
+	// that does not exist, or one other than the template its guest state was
+	// built on.
+	ErrActorTemplateNotFound = errors.New("persistence: actor template not found")
+
+	// ErrActorTemplateDeleting indicates an actor write named an ActorTemplate
+	// that MarkActorTemplateDeleting marked.
+	ErrActorTemplateDeleting = errors.New("persistence: actor template is being deleted")
 )
+
+// ActorTemplateInUseError reports the actors that kept
+// MarkActorTemplateDeleting from marking a template. It matches
+// ErrFailedPrecondition.
+//
+// It names only actors in the template's own atespace. Templates are shared
+// across atespaces, and a caller allowed to delete one may not be allowed to
+// read actors in the atespaces that use it, so actors there are only counted.
+type ActorTemplateInUseError struct {
+	// Actors holds the first few blocking actors in the template's atespace,
+	// in no particular order.
+	Actors []resources.ActorRef
+	// More reports that other actors in the template's atespace block the
+	// delete too.
+	More bool
+	// OtherAtespaces counts the blocking actors in other atespaces.
+	OtherAtespaces int
+}
+
+func (e *ActorTemplateInUseError) Error() string {
+	return fmt.Sprintf("persistence: actor template in use by %v (more: %t) and by %d actors in other atespaces", e.Actors, e.More, e.OtherAtespaces)
+}
+
+func (e *ActorTemplateInUseError) Is(target error) bool { return target == ErrFailedPrecondition }
 
 // Interface defines the contract for the persistence layer storing actor state.
 type Interface interface {
@@ -70,6 +103,12 @@ type Interface interface {
 	// server-assigned metadata (uid, version, timestamps). The input is not
 	// mutated. Returns ErrAlreadyExists if key is taken, or
 	// ErrFailedPrecondition if the actor's atespace does not exist.
+	//
+	// When the actor names an ActorTemplate, the insert waits out a concurrent
+	// MarkActorTemplateDeleting of it. It returns ErrActorTemplateDeleting if
+	// the template is marked, and ErrActorTemplateNotFound if the template
+	// does not exist or if status.externalSnapshot.actorTemplateUid is set
+	// and the template's uid differs.
 	CreateActor(ctx context.Context, actor *ateapipb.Actor) (*ateapipb.Actor, error)
 
 	// Fetches an actor by reference. Returns ErrNotFound if missing.
@@ -98,6 +137,11 @@ type Interface interface {
 	// exhausted, or the mutate's error verbatim otherwise. Immutable fields
 	// are not checked here; the service layer enforces them via declarative
 	// validation before the write.
+	//
+	// An update that changes actor_template waits out a concurrent
+	// MarkActorTemplateDeleting of the new template. It returns
+	// ErrActorTemplateDeleting if that template is marked, and
+	// ErrActorTemplateNotFound if it does not exist.
 	UpdateActor(ctx context.Context, actorRef resources.ActorRef, precondition Precondition, mutate func(toUpdate *ateapipb.Actor) error) (*ateapipb.Actor, error)
 
 	// Removes an actor and returns the deleted resource. Returns ErrNotFound if
@@ -217,9 +261,24 @@ type Interface interface {
 	// version guards are required.
 	UpdateActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef, precondition Precondition, mutate func(dbTemplate *ateapipb.ActorTemplate) error) (*ateapipb.ActorTemplate, error)
 
-	// Removes an ActorTemplate and returns the deleted resource. Returns
-	// ErrNotFound if missing, or ErrUIDConflict/ErrVersionConflict if
-	// precondition does not describe the template the caller observed.
+	// MarkActorTemplateDeleting checks precondition and asks blocks about
+	// every stored actor while holding the template locked against
+	// CreateActor and against an UpdateActor that repoints an actor at it. If
+	// no actor blocks, it marks the template deleting and returns it; from
+	// then on those writes fail with ErrActorTemplateDeleting. Marking a
+	// marked template repeats the checks. Returns ErrNotFound if missing,
+	// ErrUIDConflict/ErrVersionConflict if precondition does not describe the
+	// template the caller observed, or *ActorTemplateInUseError if blocks
+	// reports an actor; none of those change anything. A nil blocks means no
+	// actor blocks. blocks runs inside the store's transaction, so it must
+	// not perform I/O or call the store.
+	MarkActorTemplateDeleting(ctx context.Context, templateRef resources.ActorTemplateRef, precondition DeletePreconditions, blocks func(tmpl *ateapipb.ActorTemplate, actor *ateapipb.Actor) bool) (*ateapipb.ActorTemplate, error)
+
+	// Removes an ActorTemplate that MarkActorTemplateDeleting marked and
+	// returns the deleted resource. Returns ErrNotFound if missing,
+	// ErrUIDConflict/ErrVersionConflict if precondition does not describe the
+	// template the caller observed, or ErrFailedPrecondition if the template
+	// is not marked.
 	DeleteActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef, precondition DeletePreconditions) (*ateapipb.ActorTemplate, error)
 
 	// Registers a new idle worker and returns the stored resource with

@@ -170,6 +170,9 @@ kubectl ate get actor-templates -a <atespace>
 kubectl ate get actor-template <name> -a <atespace> -o yaml
 
 # Delete a template. This also deletes its golden actor and golden snapshot.
+# It is refused while any actor still uses the template: delete those actors
+# first, or repoint them to another template, then resume and suspend them
+# once.
 kubectl ate delete actor-template <name> -a <atespace>
 ```
 

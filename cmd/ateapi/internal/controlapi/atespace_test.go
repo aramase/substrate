@@ -19,7 +19,6 @@ import (
 	"testing"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/authz"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
 	"github.com/agent-substrate/substrate/internal/apierror"
 	"github.com/agent-substrate/substrate/internal/principal"
@@ -198,9 +197,7 @@ func TestAtespace_EndToEndOpenFGAScenarios(t *testing.T) {
 	}
 
 	// --- Scenario 3: Atomic rollback if DeleteAtespacePolicies fails after DELETE FROM atespaces ---
-	if _, err := persistence.DeleteActorTemplate(ctx, resources.ActorTemplateRefFromActorTemplate(tmpl), store.DeletePreconditions{}); err != nil {
-		t.Fatalf("DeleteActorTemplate failed: %v", err)
-	}
+	mustRemoveActorTemplate(t, ctx, persistence, resources.ActorTemplateRefFromActorTemplate(tmpl))
 	// Install a temporary PostgreSQL BEFORE DELETE trigger on OpenFGA's `tuple` table
 	// so that `DELETE FROM atespaces WHERE name = 'team-1'` and `fgaServer.Read` both
 	// succeed inside `tx`, and then `fgaServer.Write` (`DELETE FROM tuple`) fails.

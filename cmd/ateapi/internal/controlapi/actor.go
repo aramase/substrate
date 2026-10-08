@@ -77,11 +77,10 @@ func (s *RPCService) CreateActor(ctx context.Context, req *ateapipb.CreateActorR
 }
 
 func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapipb.Actor) (*ateapipb.Actor, error) {
-	// Check that the referenced ActorTemplate exists.
-	// FIXME: This is not atomic and it is not a guarantee that the template
-	// will still exist later.  Checking it here produces a nice error UX, but
-	// we still have to handle the template not existing later, which makes the
-	// UX inconsistent, at best.  Is it actually worth checking at all?
+	// Resolve the referenced ActorTemplate for its golden tag and volumes. The
+	// store checks the template again under a lock when it inserts the actor,
+	// so the actor cannot land on a template DeleteActorTemplate has cleared
+	// for deletion.
 	template, err := resolveActorTemplate(ctx, s.store, inActor)
 	if err != nil {
 		return nil, err
@@ -155,6 +154,14 @@ func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapipb.Actor) 
 		}
 		if errors.Is(err, store.ErrFailedPrecondition) {
 			return nil, apierror.FailedPrecondition("Atespace %s not found", atespace)
+		}
+		if errors.Is(err, store.ErrActorTemplateDeleting) {
+			return nil, apierror.FailedPrecondition("ActorTemplate %s is being deleted", resources.ActorTemplateRefFromObjectRef(inActor.GetActorTemplate()))
+		}
+		if errors.Is(err, store.ErrActorTemplateNotFound) {
+			// The template was deleted, or deleted and recreated, after it
+			// was resolved above.
+			return nil, fmt.Errorf("%w; ObjectRef: %s ", errActorTemplateNotFound, resources.ActorTemplateRefFromObjectRef(inActor.GetActorTemplate()))
 		}
 		return nil, fmt.Errorf("while recording actor: %w", err)
 	}
@@ -349,6 +356,13 @@ func (s *ServiceImpl) UpdateActor(ctx context.Context, actorRef resources.ActorR
 		}
 		if errors.Is(err, store.ErrPreconditionRequired) {
 			return nil, apierror.InvalidArgument("while updating actor %s: %v", actorRef, err)
+		}
+		if errors.Is(err, store.ErrActorTemplateDeleting) {
+			return nil, apierror.FailedPrecondition("while updating actor %s: its new ActorTemplate is being deleted", actorRef)
+		}
+		if errors.Is(err, store.ErrActorTemplateNotFound) {
+			// The new template was deleted after the mutate resolved it.
+			return nil, fmt.Errorf("%w; actor %s", errActorTemplateNotFound, actorRef)
 		}
 		return nil, fmt.Errorf("while updating actor: %w", err)
 	}

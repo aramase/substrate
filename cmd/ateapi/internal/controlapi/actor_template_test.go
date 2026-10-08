@@ -19,11 +19,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
 	"github.com/agent-substrate/substrate/internal/apierror"
+	"github.com/agent-substrate/substrate/internal/objectstore/objectstoretest"
 	"github.com/agent-substrate/substrate/internal/objectstoreplugin/objectstoreplugintest"
 	"github.com/agent-substrate/substrate/internal/resources"
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
@@ -473,4 +476,380 @@ func TestUpdateActorTemplateMetadata(t *testing.T) {
 	if got, want := reverted.GetMetadata().GetUid(), created.GetMetadata().GetUid(); got != want {
 		t.Errorf("uid after update = %q, want %q", got, want)
 	}
+}
+
+// goldenTemplateFixture is a template whose golden snapshot finished: the
+// golden tag holds a snapshot in object storage and the template's status
+// names it. The golden actor is still present, as when a golden build is cut
+// short.
+type goldenTemplateFixture struct {
+	tmpl        *ateapipb.ActorTemplate
+	templateRef resources.ActorTemplateRef
+	goldenRef   resources.ActorRef
+	tagRef      resources.TagRef
+	tagURI      resources.SnapshotURI
+	workflow    *ActorWorkflow
+	objects     *objectstoretest.Fake
+	svc         *RPCService
+}
+
+func seedGoldenTemplate(t *testing.T, ctx context.Context, persistence store.Interface) goldenTemplateFixture {
+	t.Helper()
+	return seedNamedGoldenTemplate(t, ctx, persistence, "tmpl")
+}
+
+func seedNamedGoldenTemplate(t *testing.T, ctx context.Context, persistence store.Interface, name string) goldenTemplateFixture {
+	t.Helper()
+	tmpl := seedSubstrateTemplate(t, ctx, persistence, name)
+	templateRef := resources.ActorTemplateRefFromActorTemplate(tmpl)
+	goldenRef := resources.ActorRef{Atespace: resources.GoldenActorAtespace, Name: tmpl.GetMetadata().GetUid()}
+	golden := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
+		Metadata:      &ateapipb.ResourceMetadata{Atespace: goldenRef.Atespace, Name: goldenRef.Name},
+		ActorTemplate: templateRef.ToObjectRef(),
+		Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+	})
+	workflow, objects := newFinalizeWorkflow(persistence)
+	actorURI := mustActorSnapshotURI(t, tmpl, golden, "snapshot")
+	objects.PutSnapshot(t, actorURI, "manifest.json")
+	mustUpdateActorStatus(t, ctx, persistence, golden, func(s *ateapipb.ActorStatus) {
+		s.ExternalSnapshot = &ateapipb.ExternalSnapshot{
+			SnapshotUri:      actorURI.String(),
+			Fidelity:         ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+			ActorTemplateUid: tmpl.GetMetadata().GetUid(),
+		}
+	})
+	toCreate := tagToCreate(goldenRef, goldenRef.Name)
+	toCreate.Scope = ateapipb.TagScope_TAG_SCOPE_PUBLISHED
+	tag, err := workflow.TagActorSnapshot(ctx, toCreate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tagRef := resources.TagRefFromTag(tag)
+	tagURI := mustReservedTagSnapshotURI(t, tag)
+	objects.PutSnapshot(t, tagURI, "manifest.json")
+	tmpl, err = persistence.UpdateActorTemplate(ctx, templateRef, store.PreconditionFrom(tmpl), func(tmpl *ateapipb.ActorTemplate) error {
+		tmpl.Status = &ateapipb.ActorTemplateStatus{GoldenSnapshotStatus: &ateapipb.GoldenSnapshotStatus{GoldenTag: tagRef.ToObjectRef()}}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return goldenTemplateFixture{
+		tmpl:        tmpl,
+		templateRef: templateRef,
+		goldenRef:   goldenRef,
+		tagRef:      tagRef,
+		tagURI:      tagURI,
+		workflow:    workflow,
+		objects:     objects,
+		svc:         &RPCService{impl: newServiceImpl(persistence, nil), actorWorkflow: workflow, snapshotPlugin: objectstoreplugintest.ControlClient(objects)},
+	}
+}
+
+// assertIntact checks that a refused delete changed nothing.
+func (f goldenTemplateFixture) assertIntact(t *testing.T, ctx context.Context, persistence store.Interface) {
+	t.Helper()
+	got, err := persistence.GetActorTemplate(ctx, f.templateRef)
+	if err != nil {
+		t.Fatalf("template after the refused delete: %v", err)
+	}
+	if diff := cmp.Diff(f.tmpl, got, protocmp.Transform()); diff != "" {
+		t.Errorf("template changed by the refused delete (-before +after):\n%s", diff)
+	}
+	if _, err := persistence.GetActor(ctx, f.goldenRef); err != nil {
+		t.Errorf("golden actor after the refused delete: %v", err)
+	}
+	if _, err := persistence.GetTag(ctx, f.tagRef); err != nil {
+		t.Errorf("golden tag after the refused delete: %v", err)
+	}
+	if got := f.objects.Snapshot(t, f.tagURI); len(got) == 0 {
+		t.Error("golden snapshot collected by the refused delete")
+	}
+}
+
+// assertDeleted checks that a delete removed the template and collected its
+// golden actor, tag and snapshot.
+func (f goldenTemplateFixture) assertDeleted(t *testing.T, ctx context.Context, persistence store.Interface) {
+	t.Helper()
+	if _, err := persistence.GetActorTemplate(ctx, f.templateRef); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetActorTemplate after delete = %v, want NotFound", err)
+	}
+	if _, err := persistence.GetActor(ctx, f.goldenRef); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetActor(golden) after delete = %v, want NotFound", err)
+	}
+	if _, err := persistence.GetTag(ctx, f.tagRef); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetTag(golden) after delete = %v, want NotFound", err)
+	}
+	if got := f.objects.Snapshot(t, f.tagURI); len(got) != 0 {
+		t.Errorf("golden snapshot still holds %v", got)
+	}
+}
+
+// TestDeleteActorTemplate_RefusedWhileInUse checks that a template is not
+// deleted while an actor still names it or borrows its golden snapshot, that
+// the refusal changes nothing, and that the delete goes through once those
+// actors are gone.
+func TestDeleteActorTemplate_RefusedWhileInUse(t *testing.T) {
+	tests := []struct {
+		name string
+		// seed stores the actor that keeps the template in use.
+		seed func(t *testing.T, ctx context.Context, persistence store.Interface, f goldenTemplateFixture) resources.ActorRef
+		// wantInError is what the refusal says about the actor. Actors in
+		// other atespaces are counted, never named.
+		wantInError func(user resources.ActorRef) string
+	}{{
+		name: "actor in the template's atespace",
+		seed: func(t *testing.T, ctx context.Context, persistence store.Interface, f goldenTemplateFixture) resources.ActorRef {
+			ref := resources.ActorRef{Atespace: f.templateRef.Atespace, Name: "user"}
+			seedWorkflowActor(t, ctx, persistence, ref, f.templateRef.Atespace, f.templateRef.Name, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+			return ref
+		},
+	}, {
+		name: "actor in another atespace",
+		seed: func(t *testing.T, ctx context.Context, persistence store.Interface, f goldenTemplateFixture) resources.ActorRef {
+			ref := resources.ActorRef{Atespace: "team-b", Name: "user"}
+			seedWorkflowActor(t, ctx, persistence, ref, f.templateRef.Atespace, f.templateRef.Name, ateapipb.ActorState_ACTOR_STATE_RUNNING)
+			return ref
+		},
+		wantInError: func(resources.ActorRef) string { return "in use by 1 actor in another atespace;" },
+	}, {
+		name: "actor repointed elsewhere that still borrows the golden snapshot",
+		seed: func(t *testing.T, ctx context.Context, persistence store.Interface, f goldenTemplateFixture) resources.ActorRef {
+			ref := resources.ActorRef{Atespace: f.templateRef.Atespace, Name: "repointed"}
+			seedWorkflowActor(t, ctx, persistence, ref, f.templateRef.Atespace, "tmpl-v2", ateapipb.ActorState_ACTOR_STATE_SUSPENDED, func(a *ateapipb.Actor) {
+				a.Status.ExternalSnapshot = &ateapipb.ExternalSnapshot{
+					SnapshotUri:      f.tagURI.String(),
+					Fidelity:         ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+					ActorTemplateUid: f.tmpl.GetMetadata().GetUid(),
+				}
+			})
+			return ref
+		},
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			persistence := newTestPersistence(t)
+			f := seedGoldenTemplate(t, ctx, persistence)
+			user := tt.seed(t, ctx, persistence, f)
+			req := &ateapipb.DeleteActorTemplateRequest{ActorTemplate: f.templateRef.ToObjectRef()}
+
+			_, err := f.svc.DeleteActorTemplate(ctx, req)
+			if apierror.Code(err) != codes.FailedPrecondition {
+				t.Fatalf("DeleteActorTemplate while in use = %v, want code FailedPrecondition", err)
+			}
+			want := "in use by actors " + user.String() + ";"
+			if tt.wantInError != nil {
+				want = tt.wantInError(user)
+				if strings.Contains(err.Error(), user.Name) {
+					t.Errorf("DeleteActorTemplate error %q names %s, an actor outside the template's atespace", err, user)
+				}
+			}
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("DeleteActorTemplate error %q does not contain %q", err, want)
+			}
+			f.assertIntact(t, ctx, persistence)
+
+			if _, err := f.workflow.DeleteActor(ctx, user, true, store.DeletePreconditions{}); err != nil {
+				t.Fatalf("DeleteActor(%s): %v", user, err)
+			}
+			if _, err := f.svc.DeleteActorTemplate(ctx, req); err != nil {
+				t.Fatalf("DeleteActorTemplate once unused: %v", err)
+			}
+			f.assertDeleted(t, ctx, persistence)
+		})
+	}
+}
+
+// TestDeleteActorTemplate_InUseErrorNamesFewActors checks that the refusal
+// names a bounded number of the actors using the template, all in the
+// template's atespace, and only counts the ones in other atespaces.
+func TestDeleteActorTemplate_InUseErrorNamesFewActors(t *testing.T) {
+	ctx := t.Context()
+	persistence := newTestPersistence(t)
+	f := seedGoldenTemplate(t, ctx, persistence)
+	const users, remoteUsers = 8, 3
+	for i := range users {
+		ref := resources.ActorRef{Atespace: f.templateRef.Atespace, Name: fmt.Sprintf("user-%d", i)}
+		seedWorkflowActor(t, ctx, persistence, ref, f.templateRef.Atespace, f.templateRef.Name, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	}
+	for i := range remoteUsers {
+		ref := resources.ActorRef{Atespace: "team-b", Name: fmt.Sprintf("remote-%d", i)}
+		seedWorkflowActor(t, ctx, persistence, ref, f.templateRef.Atespace, f.templateRef.Name, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	}
+	_, err := f.svc.DeleteActorTemplate(ctx, &ateapipb.DeleteActorTemplateRequest{ActorTemplate: f.templateRef.ToObjectRef()})
+	if apierror.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("DeleteActorTemplate while in use = %v, want code FailedPrecondition", err)
+	}
+	named := strings.Count(err.Error(), f.templateRef.Atespace+"/user-")
+	if named == 0 || named >= users {
+		t.Errorf("DeleteActorTemplate error %q names %d of %d actors, want some but not all", err, named, users)
+	}
+	if !strings.Contains(err.Error(), "and others") {
+		t.Errorf("DeleteActorTemplate error %q does not say more actors use the template", err)
+	}
+	if strings.Contains(err.Error(), "remote-") {
+		t.Errorf("DeleteActorTemplate error %q names actors outside the template's atespace", err)
+	}
+	if want := fmt.Sprintf("and by %d actors in other atespaces;", remoteUsers); !strings.Contains(err.Error(), want) {
+		t.Errorf("DeleteActorTemplate error %q does not contain %q", err, want)
+	}
+	f.assertIntact(t, ctx, persistence)
+}
+
+// signalingCreateStore reports when CreateActor reaches the store, which is
+// after the service resolved the template and its golden tag.
+type signalingCreateStore struct {
+	store.Interface
+	reached chan struct{}
+}
+
+func (s *signalingCreateStore) CreateActor(ctx context.Context, actor *ateapipb.Actor) (*ateapipb.Actor, error) {
+	close(s.reached)
+	return s.Interface.CreateActor(ctx, actor)
+}
+
+// TestDeleteActorTemplate_ConcurrentCreateActor creates an actor from the
+// template while the delete is collecting the golden snapshot, after the
+// create already resolved the template and borrowed that snapshot. The create
+// must fail rather than leave an actor naming a deleted template and
+// borrowing a deleted snapshot.
+func TestDeleteActorTemplate_ConcurrentCreateActor(t *testing.T) {
+	ctx := t.Context()
+	persistence := newTestPersistence(t)
+	f := seedGoldenTemplate(t, ctx, persistence)
+	creating := &signalingCreateStore{Interface: persistence, reached: make(chan struct{})}
+	creator := newServiceImpl(creating, nil)
+	actorRef := resources.ActorRef{Atespace: f.templateRef.Atespace, Name: "racer"}
+
+	type result struct {
+		actor *ateapipb.Actor
+		err   error
+	}
+	created := make(chan result, 1)
+	var started bool
+	f.objects.OnDelete = func(_, key string) error {
+		if started || !strings.Contains(key, "/tags/") {
+			return nil
+		}
+		started = true
+		go func() {
+			a, err := creator.CreateActor(context.WithoutCancel(ctx), &ateapipb.Actor{
+				Metadata:      &ateapipb.ResourceMetadata{Atespace: actorRef.Atespace, Name: actorRef.Name},
+				ActorTemplate: f.templateRef.ToObjectRef(),
+			})
+			created <- result{a, err}
+		}()
+		select {
+		case <-creating.reached:
+		case <-time.After(30 * time.Second):
+			t.Error("CreateActor never reached the store")
+			return nil
+		}
+		// Give the create time to finish if nothing holds it back.
+		select {
+		case r := <-created:
+			created <- r
+		case <-time.After(2 * time.Second):
+		}
+		return nil
+	}
+
+	if _, err := f.svc.DeleteActorTemplate(ctx, &ateapipb.DeleteActorTemplateRequest{ActorTemplate: f.templateRef.ToObjectRef()}); err != nil {
+		t.Fatalf("DeleteActorTemplate: %v", err)
+	}
+	if !started {
+		t.Fatal("the delete never collected the golden snapshot")
+	}
+	var r result
+	select {
+	case r = <-created:
+	case <-time.After(30 * time.Second):
+		t.Fatal("CreateActor did not return after the delete")
+	}
+	if r.err == nil {
+		t.Errorf("CreateActor during the delete succeeded with snapshot %q, want an error", r.actor.GetStatus().GetExternalSnapshot().GetSnapshotUri())
+	} else if apierror.Code(r.err) != codes.FailedPrecondition {
+		t.Errorf("CreateActor during the delete = %v, want code FailedPrecondition", r.err)
+	}
+	if _, err := persistence.GetActor(ctx, actorRef); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetActor(%s) after the delete = %v, want NotFound", actorRef, err)
+	}
+	f.assertDeleted(t, ctx, persistence)
+}
+
+// TestDeleteActorTemplate_ConcurrentDeletesFitThePool runs as many template
+// deletes at once as the store's pool has connections. The golden cleanup
+// takes leases and writes through the same pool, so a delete that held a
+// connection across it would leave every delete waiting on a second one.
+func TestDeleteActorTemplate_ConcurrentDeletesFitThePool(t *testing.T) {
+	for _, n := range []int{1, 2, 4} {
+		t.Run(fmt.Sprintf("%d deletes, %d connections", n, n), func(t *testing.T) {
+			seeded := storetest.SetupPostgresPersistence(t)
+			ctx := t.Context()
+			storetest.MustCreateAtespace(t, ctx, seeded, "team-a")
+			fixtures := make([]goldenTemplateFixture, n)
+			for i := range fixtures {
+				fixtures[i] = seedNamedGoldenTemplate(t, ctx, seeded, fmt.Sprintf("tmpl-%d", i))
+			}
+			persistence := storetest.ReopenWithMaxConns(t, seeded, int32(n))
+
+			deleteCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			errs := make([]error, n)
+			var wg sync.WaitGroup
+			for i, f := range fixtures {
+				workflow := &ActorWorkflow{store: persistence, snapshotPlugin: objectstoreplugintest.ControlClient(f.objects)}
+				wg.Go(func() {
+					_, errs[i] = workflow.DeleteActorTemplate(deleteCtx, f.templateRef, store.DeletePreconditions{})
+				})
+			}
+			wg.Wait()
+			for i, f := range fixtures {
+				if errs[i] != nil {
+					t.Errorf("DeleteActorTemplate(%s): %v", f.templateRef, errs[i])
+					continue
+				}
+				f.assertDeleted(t, ctx, persistence)
+			}
+		})
+	}
+}
+
+// TestDeleteActorTemplate_RetryAfterFailedCleanup fails the golden snapshot
+// collection once. The template must stay, refusing new actors, until a retry
+// finishes the cleanup.
+func TestDeleteActorTemplate_RetryAfterFailedCleanup(t *testing.T) {
+	ctx := t.Context()
+	persistence := newTestPersistence(t)
+	f := seedGoldenTemplate(t, ctx, persistence)
+	errStorage := errors.New("object storage unavailable")
+	failing := true
+	f.objects.OnDelete = func(_, key string) error {
+		if failing && strings.Contains(key, "/tags/") {
+			return errStorage
+		}
+		return nil
+	}
+	req := &ateapipb.DeleteActorTemplateRequest{ActorTemplate: f.templateRef.ToObjectRef()}
+
+	if _, err := f.svc.DeleteActorTemplate(ctx, req); err == nil {
+		t.Fatal("DeleteActorTemplate with failing object storage succeeded, want an error")
+	}
+	if _, err := persistence.GetActorTemplate(ctx, f.templateRef); err != nil {
+		t.Fatalf("template after the failed delete: %v", err)
+	}
+	_, err := newServiceImpl(persistence, nil).CreateActor(ctx, &ateapipb.Actor{
+		Metadata:      &ateapipb.ResourceMetadata{Atespace: f.templateRef.Atespace, Name: "late"},
+		ActorTemplate: f.templateRef.ToObjectRef(),
+	})
+	if apierror.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "is being deleted") {
+		t.Errorf("CreateActor from a template whose delete failed part-way = %v, want FailedPrecondition saying it is being deleted", err)
+	}
+
+	failing = false
+	if _, err := f.svc.DeleteActorTemplate(ctx, req); err != nil {
+		t.Fatalf("DeleteActorTemplate retry: %v", err)
+	}
+	f.assertDeleted(t, ctx, persistence)
 }

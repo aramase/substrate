@@ -164,9 +164,7 @@ func DeploySubstrateFixture(t *testing.T, ctx context.Context, clients *Clients,
 	created := make([]*ateapipb.ActorTemplate, 0, len(templates))
 	for _, tmpl := range templates {
 		ref := &ateapipb.ObjectRef{Atespace: atespace, Name: tmpl.GetMetadata().GetName()}
-		if _, err := clients.SubstrateAPI.DeleteActorTemplate(ctx, &ateapipb.DeleteActorTemplateRequest{ActorTemplate: ref}); err != nil && status.Code(err) != codes.NotFound {
-			t.Fatalf("failed to clear leaked ActorTemplate %s/%s: %v", atespace, ref.GetName(), err)
-		}
+		clearLeakedSubstrateTemplate(t, ctx, clients, ref)
 		c, err := clients.SubstrateAPI.CreateActorTemplate(ctx, &ateapipb.CreateActorTemplateRequest{ActorTemplate: tmpl})
 		if err != nil {
 			t.Fatalf("failed to create ActorTemplate %s/%s: %v", atespace, tmpl.GetMetadata().GetName(), err)
@@ -188,4 +186,51 @@ func DeploySubstrateFixture(t *testing.T, ctx context.Context, clients *Clients,
 		WaitForSubstrateTemplateReady(ctx, t, clients, atespace, tmpl.GetMetadata().GetName())
 	}
 	return atespace, created
+}
+
+// clearLeakedSubstrateTemplate deletes the ActorTemplate at ref if an aborted
+// earlier run left it behind. The delete is refused while actors use the
+// template, so the leaked actors that name it are deleted first.
+func clearLeakedSubstrateTemplate(t *testing.T, ctx context.Context, clients *Clients, ref *ateapipb.ObjectRef) {
+	t.Helper()
+	deleteTemplate := func() error {
+		_, err := clients.SubstrateAPI.DeleteActorTemplate(ctx, &ateapipb.DeleteActorTemplateRequest{ActorTemplate: ref})
+		return err
+	}
+	err := deleteTemplate()
+	if status.Code(err) == codes.FailedPrecondition {
+		deleteActorsNamingTemplate(t, ctx, clients, ref)
+		err = deleteTemplate()
+	}
+	if err != nil && status.Code(err) != codes.NotFound {
+		t.Fatalf("failed to clear leaked ActorTemplate %s/%s: %v", ref.GetAtespace(), ref.GetName(), err)
+	}
+}
+
+// deleteActorsNamingTemplate deletes every actor, in any atespace and any
+// state, whose actor_template is ref.
+func deleteActorsNamingTemplate(t *testing.T, ctx context.Context, clients *Clients, ref *ateapipb.ObjectRef) {
+	t.Helper()
+	pageToken := ""
+	for {
+		// An empty atespace lists across all atespaces.
+		resp, err := clients.SubstrateAPI.ListActors(ctx, &ateapipb.ListActorsRequest{PageSize: 1000, PageToken: pageToken})
+		if err != nil {
+			t.Fatalf("failed to list actors using leaked ActorTemplate %s/%s: %v", ref.GetAtespace(), ref.GetName(), err)
+		}
+		for _, actor := range resp.GetActors() {
+			if actor.GetActorTemplate().GetAtespace() != ref.GetAtespace() || actor.GetActorTemplate().GetName() != ref.GetName() {
+				continue
+			}
+			actorRef := &ateapipb.ObjectRef{Atespace: actor.GetMetadata().GetAtespace(), Name: actor.GetMetadata().GetName()}
+			t.Logf("Deleting leaked actor %s/%s that uses ActorTemplate %s/%s", actorRef.GetAtespace(), actorRef.GetName(), ref.GetAtespace(), ref.GetName())
+			if _, err := clients.SubstrateAPI.DeleteActor(ctx, &ateapipb.DeleteActorRequest{Actor: actorRef, AnyState: true}); err != nil && status.Code(err) != codes.NotFound {
+				t.Fatalf("failed to delete leaked actor %s/%s: %v", actorRef.GetAtespace(), actorRef.GetName(), err)
+			}
+		}
+		pageToken = resp.GetNextPageToken()
+		if pageToken == "" {
+			return
+		}
+	}
 }

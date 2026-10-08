@@ -893,12 +893,16 @@ func TestLoadActorForResume_DoesNotDefaultGolden(t *testing.T) {
 	persistence := newTestPersistence(t)
 	actorRef := resources.ActorRef{Atespace: "team-a", Name: "id1"}
 	seedWorkflowActor(t, ctx, persistence, actorRef, "ns", "tmpl1", ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
-	storetest.MustCreateAtespace(t, ctx, persistence, "ns")
-	if _, err := persistence.CreateActorTemplate(ctx, &ateapipb.ActorTemplate{
-		Metadata: &ateapipb.ResourceMetadata{Atespace: "ns", Name: "tmpl1"},
-		Status: &ateapipb.ActorTemplateStatus{GoldenSnapshotStatus: &ateapipb.GoldenSnapshotStatus{
+	tmplRef := resources.ActorTemplateRef{Atespace: "ns", Name: "tmpl1"}
+	tmpl, err := persistence.GetActorTemplate(ctx, tmplRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistence.UpdateActorTemplate(ctx, tmplRef, store.PreconditionFrom(tmpl), func(tmpl *ateapipb.ActorTemplate) error {
+		tmpl.Status = &ateapipb.ActorTemplateStatus{GoldenSnapshotStatus: &ateapipb.GoldenSnapshotStatus{
 			GoldenTag: &ateapipb.ObjectRef{Atespace: "ns", Name: "golden"},
-		}},
+		}}
+		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}

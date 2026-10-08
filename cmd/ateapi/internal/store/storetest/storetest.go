@@ -33,6 +33,7 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/atepg"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/dockerenv"
+	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -95,6 +96,31 @@ func SetupPostgresPersistence(t *testing.T) *atepg.Persistence {
 	return persistence
 }
 
+// ReopenWithMaxConns opens a second persistence on p's database through a
+// pool capped at maxConns, for tests of behavior under pool pressure. Set up
+// and seed through p: authz setup alone needs more than one connection. The
+// returned persistence has no policy manager.
+func ReopenWithMaxConns(t *testing.T, p *atepg.Persistence, maxConns int32) *atepg.Persistence {
+	t.Helper()
+	ctx := context.Background()
+	config := p.Pool().Config().Copy()
+	config.MaxConns = maxConns
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatalf("connecting to PostgreSQL test database: %v", err)
+	}
+	reopened, err := atepg.NewPersistence(ctx, pool)
+	if err != nil {
+		pool.Close()
+		t.Fatalf("creating PostgreSQL persistence: %v", err)
+	}
+	t.Cleanup(func() {
+		reopened.Close()
+		pool.Close()
+	})
+	return reopened
+}
+
 // MustCreateAtespace creates name unless it already exists. PostgreSQL enforces
 // the parent relationship for actor and snapshot records, so test fixtures use
 // this before seeding those resources.
@@ -106,18 +132,42 @@ func MustCreateAtespace(t *testing.T, ctx context.Context, s store.Interface, na
 	}
 }
 
-// MustCreateActor ensures actor's parent atespace exists, then creates actor.
-// Use the store method directly only in tests that exercise missing-parent
-// behavior.
+// MustCreateActor ensures actor's parent atespace and the ActorTemplate it
+// names exist, then creates actor. A template it has to create carries only
+// metadata. Use the store method directly only in tests that exercise
+// missing-parent behavior.
 func MustCreateActor(t *testing.T, ctx context.Context, s store.Interface, actor *ateapipb.Actor) *ateapipb.Actor {
 	t.Helper()
 	atespace := actor.GetMetadata().GetAtespace()
 	MustCreateAtespace(t, ctx, s, atespace)
+	if ref := actor.GetActorTemplate(); ref != nil {
+		mustEnsureActorTemplate(t, ctx, s, ref)
+	}
 	created, err := s.CreateActor(ctx, actor)
 	if err != nil {
 		t.Fatalf("creating test actor %q/%q: %v", atespace, actor.GetMetadata().GetName(), err)
 	}
 	return created
+}
+
+// mustEnsureActorTemplate creates a metadata-only ActorTemplate at ref unless
+// one exists.
+func mustEnsureActorTemplate(t *testing.T, ctx context.Context, s store.Interface, ref *ateapipb.ObjectRef) {
+	t.Helper()
+	templateRef := resources.ActorTemplateRefFromObjectRef(ref)
+	_, err := s.GetActorTemplate(ctx, templateRef)
+	if err == nil {
+		return
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("getting test actor template %s: %v", templateRef, err)
+	}
+	MustCreateAtespace(t, ctx, s, templateRef.Atespace)
+	if _, err := s.CreateActorTemplate(ctx, &ateapipb.ActorTemplate{
+		Metadata: &ateapipb.ResourceMetadata{Atespace: templateRef.Atespace, Name: templateRef.Name},
+	}); err != nil {
+		t.Fatalf("creating test actor template %s: %v", templateRef, err)
+	}
 }
 
 // MustCreateTag ensures tag's parent atespace exists, then stores

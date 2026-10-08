@@ -42,10 +42,30 @@ func (p *Persistence) CreateActor(ctx context.Context, actor *ateapipb.Actor) (*
 		return nil, fmt.Errorf("marshaling actor: %w", err)
 	}
 
-	_, err = p.pool.Exec(ctx, `
-		INSERT INTO actors (atespace, name, uid, version, proto)
-		VALUES ($1, $2, $3, $4, $5)`,
-		atespace, name, dbActor.GetMetadata().GetUid(), dbActor.GetMetadata().GetVersion(), protoBytes)
+	// The template row is taken FOR SHARE for the length of the insert, so it
+	// cannot interleave with MarkActorTemplateDeleting's in-use check and
+	// mark. The statement also reports the deleting mark it saw, so a refused
+	// insert can say why.
+	var templateAtespace, templateName *string
+	if ref := dbActor.GetActorTemplate(); ref != nil {
+		templateAtespace, templateName = &ref.Atespace, &ref.Name
+	}
+	var inserted bool
+	var templateDeleting *bool
+	err = p.pool.QueryRow(ctx, `
+		WITH template AS (
+			SELECT uid, deleting FROM actor_templates
+			WHERE atespace = $6 AND name = $7
+			FOR SHARE),
+		inserted AS (
+			INSERT INTO actors (atespace, name, uid, version, proto)
+			SELECT $1::text, $2::text, $3::text, $4::bigint, $5::bytea
+			WHERE $6::text IS NULL
+			   OR EXISTS (SELECT 1 FROM template WHERE NOT deleting AND ($8::text = '' OR uid = $8::text))
+			RETURNING 1)
+		SELECT EXISTS (SELECT 1 FROM inserted), (SELECT deleting FROM template)`,
+		atespace, name, dbActor.GetMetadata().GetUid(), dbActor.GetMetadata().GetVersion(), protoBytes,
+		templateAtespace, templateName, dbActor.GetStatus().GetExternalSnapshot().GetActorTemplateUid()).Scan(&inserted, &templateDeleting)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return nil, store.ErrAlreadyExists
@@ -57,7 +77,35 @@ func (p *Persistence) CreateActor(ctx context.Context, actor *ateapipb.Actor) (*
 		}
 		return nil, fmt.Errorf("inserting actor %s/%s: %w", atespace, name, err)
 	}
+	if !inserted {
+		if templateDeleting != nil && *templateDeleting {
+			return nil, store.ErrActorTemplateDeleting
+		}
+		return nil, store.ErrActorTemplateNotFound
+	}
 	return dbActor, nil
+}
+
+// shareLockActorTemplate takes the template row FOR SHARE until tx ends,
+// which MarkActorTemplateDeleting's FOR UPDATE excludes. Returns
+// ErrActorTemplateNotFound if the template does not exist, or
+// ErrActorTemplateDeleting if it is marked deleting.
+func shareLockActorTemplate(ctx context.Context, tx pgx.Tx, ref *ateapipb.ObjectRef) error {
+	var deleting bool
+	err := tx.QueryRow(ctx, `
+		SELECT deleting FROM actor_templates
+		WHERE atespace = $1 AND name = $2
+		FOR SHARE`, ref.GetAtespace(), ref.GetName()).Scan(&deleting)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.ErrActorTemplateNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("locking actor template %s/%s: %w", ref.GetAtespace(), ref.GetName(), err)
+	}
+	if deleting {
+		return store.ErrActorTemplateDeleting
+	}
+	return nil
 }
 
 func (p *Persistence) GetActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error) {
@@ -104,6 +152,7 @@ func (p *Persistence) UpdateActor(ctx context.Context, actorRef resources.ActorR
 		return nil, err
 	}
 	oldMeta := proto.CloneOf(dbActor.Metadata)
+	oldTemplateRef := proto.CloneOf(dbActor.GetActorTemplate())
 	if err := mutate(dbActor); err != nil {
 		return nil, err
 	}
@@ -115,7 +164,23 @@ func (p *Persistence) UpdateActor(ctx context.Context, actorRef resources.ActorR
 	if err != nil {
 		return nil, fmt.Errorf("marshaling actor: %w", err)
 	}
-	commandTag, err := p.pool.Exec(ctx, `
+	// A repoint must not land on a template being deleted, so it writes in a
+	// transaction holding the new template FOR SHARE. Every
+	// other update is a single statement.
+	var db querier = p.pool
+	var tx pgx.Tx
+	if newRef := dbActor.GetActorTemplate(); newRef != nil && !proto.Equal(oldTemplateRef, newRef) {
+		tx, err = p.pool.Begin(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("beginning actor update: %w", err)
+		}
+		defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+		if err := shareLockActorTemplate(ctx, tx, newRef); err != nil {
+			return nil, err
+		}
+		db = tx
+	}
+	commandTag, err := db.Exec(ctx, `
 			UPDATE actors
 			SET version = $1, proto = $2
 			WHERE atespace = $3 AND name = $4 AND uid = $5 AND version = $6`,
@@ -128,6 +193,11 @@ func (p *Persistence) UpdateActor(ctx context.Context, actorRef resources.ActorR
 	}
 	if commandTag.RowsAffected() != 1 {
 		return nil, fmt.Errorf("updating actor %s/%s affected %d rows, want 1", atespace, name, commandTag.RowsAffected())
+	}
+	if tx != nil {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("committing actor update %s/%s: %w", atespace, name, err)
+		}
 	}
 	return dbActor, nil
 }
@@ -167,7 +237,7 @@ func (p *Persistence) ListActors(ctx context.Context, atespace string, opts stor
 	if atespace != "" {
 		items, nextToken, err = p.listActorsScoped(ctx, atespace, opts.PageSize, opts.PageToken)
 	} else {
-		items, nextToken, err = p.listActorsGlobal(ctx, opts.PageSize, opts.PageToken)
+		items, nextToken, err = listActorsGlobal(ctx, p.pool, opts.PageSize, opts.PageToken)
 	}
 	if err != nil {
 		return store.ListResponse[*ateapipb.Actor]{}, err
@@ -222,7 +292,9 @@ func (p *Persistence) listActorsScoped(ctx context.Context, atespace string, pag
 	return result, nextToken, nil
 }
 
-func (p *Persistence) listActorsGlobal(ctx context.Context, pageSize int32, pageTokenStr string) ([]*ateapipb.Actor, string, error) {
+// listActorsGlobal lists one page of actors across every atespace, through db
+// so a transaction can page with it too.
+func listActorsGlobal(ctx context.Context, db querier, pageSize int32, pageTokenStr string) ([]*ateapipb.Actor, string, error) {
 	token, err := decodePageToken(pageTokenStr, kindActor, "", 2)
 	if err != nil {
 		return nil, "", err
@@ -232,7 +304,7 @@ func (p *Persistence) listActorsGlobal(ctx context.Context, pageSize int32, page
 		lastAtespace, lastName = &token.Last[0], &token.Last[1]
 	}
 
-	rows, err := p.pool.Query(ctx, `
+	rows, err := db.Query(ctx, `
 		SELECT atespace, name, proto FROM actors
 		WHERE $1::text IS NULL OR (atespace, name) > ($1, $2)
 		ORDER BY atespace, name
