@@ -74,6 +74,22 @@ of running pods, so clean up once you are done reading:
 $ hack/cleanup-e2e.sh   # deletes every namespace labeled ate.dev/e2e
 ```
 
+A suite's fixture also creates an atespace through the ate API, and the suite
+must create it afresh: an existing one could belong to another run of the same
+suite, so the fixture fails rather than touch it. A failed run still deletes
+its fixture's actors, ActorTemplates and atespace, but one that was killed
+before its cleanups ran (a `go test` timeout, Ctrl-C) leaves them behind, and
+the next run of that suite fails with `atespace "<name>" already exists`. Once
+no other run is using it, delete what is in it, then the atespace:
+
+```shell
+$ kubectl ate get actors -a <atespace>
+$ kubectl ate delete actor -a <atespace> --any-state <actor>   # for each actor
+$ kubectl ate get actor-templates -a <atespace>
+$ kubectl ate delete actor-template -a <atespace> <template>   # for each template
+$ kubectl ate delete atespace <atespace>
+```
+
 ## Creating a new test suite
 
 Copy `testmain_test.go` from `internal/e2e/suites/example` into your new suite. It will

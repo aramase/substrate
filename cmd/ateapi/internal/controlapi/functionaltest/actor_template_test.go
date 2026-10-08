@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/controlapi"
+	"github.com/agent-substrate/substrate/internal/e2e/fixturecleanup"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -286,13 +287,20 @@ func TestDeleteActorTemplate_Preconditions(t *testing.T) {
 }
 
 // buildGoldenTemplate creates a template and runs the reconciler until its
-// golden tag is ready. It returns the template as stored then, and the golden
-// tag.
-func buildGoldenTemplate(t *testing.T, ctx context.Context, tc *testContext, ns string) (*ateapipb.ActorTemplate, *ateapipb.Tag) {
+// golden tag is ready. It returns the template as stored then, the golden
+// tag, and the one worker the template's actors run on.
+func buildGoldenTemplate(t *testing.T, ctx context.Context, tc *testContext, ns string) (*ateapipb.ActorTemplate, *ateapipb.Tag, string) {
+	t.Helper()
+	return buildGoldenTemplateIn(t, ctx, tc, ns, testAtespace)
+}
+
+// buildGoldenTemplateIn is buildGoldenTemplate for a template in atespace,
+// which must already exist.
+func buildGoldenTemplateIn(t *testing.T, ctx context.Context, tc *testContext, ns, atespace string) (*ateapipb.ActorTemplate, *ateapipb.Tag, string) {
 	t.Helper()
 	createWorkerPool(t, tc, ns, "pool1", map[string]string{poolLabelKey: ns})
-	created := createTemplateWithSelector(t, tc, "golden-template", &ateapipb.Selector{MatchLabels: map[string]string{poolLabelKey: ns}})
-	createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
+	created := createTemplateInAtespace(t, tc, atespace, "golden-template", &ateapipb.Selector{MatchLabels: map[string]string{poolLabelKey: ns}})
+	workerName := createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
 	templateRef := resources.ActorTemplateRefFromActorTemplate(created).ToObjectRef()
 	controlapi.NewActorTemplateReconciler(tc.persistence, tc.service, 7*time.Second).Start(ctx)
 	var tmpl *ateapipb.ActorTemplate
@@ -309,7 +317,7 @@ func buildGoldenTemplate(t *testing.T, ctx context.Context, tc *testContext, ns 
 		t.Fatal(err)
 	}
 	assertSnapshotPresent(t, tc, golden.GetStatus().GetSnapshot().GetSnapshotUri())
-	return tmpl, golden
+	return tmpl, golden, workerName
 }
 
 // TestDeleteActorTemplate_RefusedWhileActorsExist checks that a template with
@@ -322,7 +330,7 @@ func TestDeleteActorTemplate_RefusedWhileActorsExist(t *testing.T) {
 	defer tc.cleanup()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	tmpl, golden := buildGoldenTemplate(t, ctx, tc, ns)
+	tmpl, golden, _ := buildGoldenTemplate(t, ctx, tc, ns)
 	templateRef := resources.ActorTemplateRefFromActorTemplate(tmpl).ToObjectRef()
 	goldenURI := golden.GetStatus().GetSnapshot().GetSnapshotUri()
 
@@ -391,7 +399,7 @@ func TestDeleteActorTemplate_ConcurrentCreateActor(t *testing.T) {
 	defer tc.cleanup()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	tmpl, golden := buildGoldenTemplate(t, ctx, tc, ns)
+	tmpl, golden, _ := buildGoldenTemplate(t, ctx, tc, ns)
 	templateRef := resources.ActorTemplateRefFromActorTemplate(tmpl).ToObjectRef()
 	actorRef := &ateapipb.ObjectRef{Atespace: testAtespace, Name: "racer"}
 
@@ -453,7 +461,7 @@ func TestDeleteActorTemplate_RepointedActorBorrowingGolden(t *testing.T) {
 	defer tc.cleanup()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	tmpl, golden := buildGoldenTemplate(t, ctx, tc, ns)
+	tmpl, golden, _ := buildGoldenTemplate(t, ctx, tc, ns)
 	templateRef := resources.ActorTemplateRefFromActorTemplate(tmpl).ToObjectRef()
 	goldenURI := golden.GetStatus().GetSnapshot().GetSnapshotUri()
 
@@ -546,5 +554,191 @@ func TestDeleteActorTemplate_RepointedActorBorrowingGolden(t *testing.T) {
 	}
 	if got := resumed.GetActor().GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_RUNNING {
 		t.Errorf("actor state after the resume = %v, want RUNNING", got)
+	}
+}
+
+// TestFixtureClaim_SparesForeignActors runs the e2e fixture's atespace claim
+// and teardown against the real server. Run A claims an atespace, builds a
+// template there and leaves actors in it, NEW, SUSPENDED and RUNNING; a live
+// actor in another atespace also uses the template. Run B, of the same
+// fixture, cannot claim A's atespace and changes nothing in it. A's teardown
+// deletes A's actors, then stops: the foreign actor, its snapshot, the
+// template and the golden snapshot are left as they were. Once nothing
+// outside A's atespace uses the template, the teardown deletes the template
+// and the atespace, and the next run can claim it again.
+func TestFixtureClaim_SparesForeignActors(t *testing.T) {
+	ns := namespaceForTest("fixture-claim")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const fixtureAtespace = "fixture-run"
+	claim, err := fixturecleanup.ClaimAtespace(ctx, tc.client, fixtureAtespace)
+	if err != nil {
+		t.Fatalf("ClaimAtespace(%s) of a new atespace: %v", fixtureAtespace, err)
+	}
+	tmpl, golden, worker1 := buildGoldenTemplateIn(t, ctx, tc, ns, fixtureAtespace)
+	worker2 := createWorkerPod(t, tc, ns, "worker-2", "node1", "pool1")
+	templateRef := resources.ActorTemplateRefFromActorTemplate(tmpl).ToObjectRef()
+	goldenURI := golden.GetStatus().GetSnapshot().GetSnapshotUri()
+
+	// waitForFreeWorkers waits for the worker cache to show exactly n of the
+	// two workers hosting nothing, so each resume sees settled placement.
+	waitForFreeWorkers := func(n int) {
+		t.Helper()
+		err := wait.PollUntilContextTimeout(ctx, 10*time.Millisecond, 5*time.Second, true, func(context.Context) (bool, error) {
+			free := 0
+			for _, name := range []string{worker1, worker2} {
+				w, err := tc.workerCache.Worker(name)
+				if err != nil {
+					return false, nil
+				}
+				if w.GetStatus().GetState() == ateapipb.WorkerState_WORKER_STATE_ACTIVE && w.GetStatus().GetAllocated().GetActors() == 0 {
+					free++
+				}
+			}
+			return free == n, nil
+		})
+		if err != nil {
+			t.Fatalf("waiting for %d free workers: %v", n, err)
+		}
+	}
+	resume := func(ref *ateapipb.ObjectRef) {
+		t.Helper()
+		if _, err := tc.client.ResumeActor(ctx, &ateapipb.ResumeActorRequest{Actor: ref}); err != nil {
+			t.Fatalf("ResumeActor(%s/%s): %v", ref.GetAtespace(), ref.GetName(), err)
+		}
+	}
+	suspend := func(ref *ateapipb.ObjectRef) string {
+		t.Helper()
+		resp, err := tc.client.SuspendActor(ctx, &ateapipb.SuspendActorRequest{Actor: ref})
+		if err != nil {
+			t.Fatalf("SuspendActor(%s/%s): %v", ref.GetAtespace(), ref.GetName(), err)
+		}
+		uri := resp.GetActor().GetStatus().GetExternalSnapshot().GetSnapshotUri()
+		assertSnapshotOwnedByActor(t, resp.GetActor(), uri)
+		return uri
+	}
+	getActor := func(ref *ateapipb.ObjectRef) *ateapipb.Actor {
+		t.Helper()
+		a, err := tc.client.GetActor(ctx, &ateapipb.GetActorRequest{Actor: ref})
+		if err != nil {
+			t.Fatalf("GetActor(%s/%s): %v", ref.GetAtespace(), ref.GetName(), err)
+		}
+		return a
+	}
+	assertUnchanged := func(when string, before *ateapipb.Actor) {
+		t.Helper()
+		after := getActor(&ateapipb.ObjectRef{Atespace: before.GetMetadata().GetAtespace(), Name: before.GetMetadata().GetName()})
+		if diff := cmp.Diff(before, after, protocmp.Transform()); diff != "" {
+			t.Errorf("actor %s/%s changed by %s (-before +after):\n%s", before.GetMetadata().GetAtespace(), before.GetMetadata().GetName(), when, diff)
+		}
+	}
+	assertTemplateUnchanged := func(when string) {
+		t.Helper()
+		after, err := tc.client.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{ActorTemplate: templateRef})
+		if err != nil {
+			t.Fatalf("GetActorTemplate after %s: %v", when, err)
+		}
+		if diff := cmp.Diff(tmpl, after, protocmp.Transform()); diff != "" {
+			t.Errorf("template changed by %s (-before +after):\n%s", when, diff)
+		}
+		assertSnapshotPresent(t, tc, goldenURI)
+	}
+
+	const foreignAtespace = "team-b"
+	createAtespace(t, tc, foreignAtespace)
+	ownNew := &ateapipb.ObjectRef{Atespace: fixtureAtespace, Name: "own-new"}
+	ownSuspended := &ateapipb.ObjectRef{Atespace: fixtureAtespace, Name: "own-suspended"}
+	ownRunning := &ateapipb.ObjectRef{Atespace: fixtureAtespace, Name: "own-running"}
+	foreign := &ateapipb.ObjectRef{Atespace: foreignAtespace, Name: "foreign"}
+	for _, ref := range []*ateapipb.ObjectRef{ownNew, ownSuspended, ownRunning, foreign} {
+		if _, err := tc.client.CreateActor(ctx, &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+			Metadata: &ateapipb.ResourceMetadata{Atespace: ref.GetAtespace(), Name: ref.GetName()}, ActorTemplate: templateRef,
+		}}); err != nil {
+			t.Fatalf("CreateActor(%s/%s): %v", ref.GetAtespace(), ref.GetName(), err)
+		}
+	}
+	waitForFreeWorkers(2)
+	resume(ownSuspended)
+	ownSuspendedURI := suspend(ownSuspended)
+	// The running actors are live, each restored from a snapshot of its own.
+	waitForFreeWorkers(2)
+	resume(ownRunning)
+	ownRunningURI := suspend(ownRunning)
+	waitForFreeWorkers(2)
+	resume(ownRunning)
+	waitForFreeWorkers(1)
+	resume(foreign)
+	foreignURI := suspend(foreign)
+	waitForFreeWorkers(1)
+	resume(foreign)
+	waitForFreeWorkers(0)
+	for _, ref := range []*ateapipb.ObjectRef{ownRunning, foreign} {
+		if got := getActor(ref).GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_RUNNING {
+			t.Fatalf("actor %s/%s state = %v, want RUNNING", ref.GetAtespace(), ref.GetName(), got)
+		}
+	}
+	ownBefore := map[string]*ateapipb.Actor{}
+	for _, ref := range []*ateapipb.ObjectRef{ownNew, ownSuspended, ownRunning} {
+		ownBefore[ref.GetName()] = getActor(ref)
+	}
+	foreignBefore := getActor(foreign)
+
+	// Run B: the atespace exists, so B cannot tell A's actors from leaked
+	// ones and touches none of them.
+	_, err = fixturecleanup.ClaimAtespace(ctx, tc.client, fixtureAtespace)
+	if status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("ClaimAtespace(%s) by a second run = %v, want code AlreadyExists", fixtureAtespace, err)
+	}
+	t.Logf("second run's claim refused as expected: %v", err)
+	for _, before := range ownBefore {
+		assertUnchanged("a second run's refused claim", before)
+	}
+	assertSnapshotPresent(t, tc, ownSuspendedURI)
+	assertSnapshotPresent(t, tc, ownRunningURI)
+	assertTemplateUnchanged("a second run's refused claim")
+
+	// Run A's teardown, with a foreign actor still using the template.
+	err = claim.DeleteTemplate(ctx, templateRef.GetName(), t.Logf)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("DeleteTemplate with a foreign actor = %v, want code FailedPrecondition", err)
+	}
+	t.Logf("DeleteTemplate refused as expected: %v", err)
+	for _, ref := range []*ateapipb.ObjectRef{ownNew, ownSuspended, ownRunning} {
+		if _, err := tc.client.GetActor(ctx, &ateapipb.GetActorRequest{Actor: ref}); status.Code(err) != codes.NotFound {
+			t.Errorf("GetActor(%s/%s) after the teardown = %v, want NotFound", ref.GetAtespace(), ref.GetName(), err)
+		}
+	}
+	assertSnapshotCollected(t, tc, ownSuspendedURI)
+	assertSnapshotCollected(t, tc, ownRunningURI)
+	assertUnchanged("the refused teardown", foreignBefore)
+	assertSnapshotPresent(t, tc, foreignURI)
+	assertTemplateUnchanged("the refused teardown")
+	if err := claim.Release(ctx); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("Release with the template still in the atespace = %v, want code FailedPrecondition", err)
+	}
+
+	// Once the foreign actor is gone, the teardown finishes.
+	if _, err := tc.client.DeleteActor(ctx, &ateapipb.DeleteActorRequest{Actor: foreign, AnyState: true}); err != nil {
+		t.Fatalf("DeleteActor(foreign): %v", err)
+	}
+	if err := claim.DeleteTemplate(ctx, templateRef.GetName(), t.Logf); err != nil {
+		t.Fatalf("DeleteTemplate once only its own atespace's actors could use it: %v", err)
+	}
+	if _, err := tc.client.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{ActorTemplate: templateRef}); status.Code(err) != codes.NotFound {
+		t.Errorf("GetActorTemplate after the teardown = %v, want NotFound", err)
+	}
+	assertSnapshotCollected(t, tc, goldenURI)
+	if err := claim.Release(ctx); err != nil {
+		t.Fatalf("Release of the emptied atespace: %v", err)
+	}
+	next, err := fixturecleanup.ClaimAtespace(ctx, tc.client, fixtureAtespace)
+	if err != nil {
+		t.Fatalf("ClaimAtespace(%s) after the release: %v", fixtureAtespace, err)
+	}
+	if err := next.Release(ctx); err != nil {
+		t.Fatalf("Release of the next run's claim: %v", err)
 	}
 }

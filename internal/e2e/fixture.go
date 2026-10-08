@@ -20,9 +20,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/internal/e2e/fixturecleanup"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"sigs.k8s.io/yaml"
 )
@@ -106,36 +105,28 @@ type SubstrateFixtureManifests struct {
 }
 
 // DeploySubstrateFixture installs a fixture for the sandbox class under test:
-// it ko-applies the pool manifest, creates the fixture's atespace and
-// ActorTemplates through the ate API (ko-resolving the templates' ko:// image
-// references first), and blocks until every template's golden snapshot
-// exists. name distinguishes the caller (by convention its suite name): each
-// suite gets its own copy of the fixture, so no suite's cleanup can delete it
-// out from under another running concurrently.
+// it creates the fixture's atespace through the ate API, ko-applies the pool
+// manifest, creates the fixture's ActorTemplates (ko-resolving the templates'
+// ko:// image references first), and blocks until every template's golden
+// snapshot exists. name distinguishes the caller (by convention its suite
+// name): each suite gets its own copy of the fixture, so no suite's cleanup
+// can delete it out from under another running concurrently.
+//
+// The run must create the atespace itself: that is what proves everything in
+// it belongs to this run. If the atespace already exists (another run of the
+// same suite is using it, or an interrupted run left it behind) the fixture
+// fails before changing anything, in the atespace or in the cluster.
 //
 // Everything is removed when the test ends. The substrate resources need
 // explicit cleanup — unlike the CRD templates they replaced, they do not ride
-// the k8s namespace GC — and a template leaked by an interrupted earlier run
-// is cleared before creating its replacement, since templates are immutable.
+// the k8s namespace GC. A template is deleted after the actors in the
+// fixture's atespace that still use it; an actor in any other atespace that
+// uses it is reported and left alone, and so are the template and atespace.
 //
 // Returns the fixture's atespace (the same string that names the k8s
 // namespace holding the pool) and the created templates.
 func DeploySubstrateFixture(t *testing.T, ctx context.Context, clients *Clients, manifests SubstrateFixtureManifests, bucket, name string, trustBundle bool) (string, []*ateapipb.ActorTemplate) {
 	t.Helper()
-
-	// The pool manifest also carries the namespace. Its cleanup is registered
-	// first so it runs last (t.Cleanup is LIFO), after the templates that
-	// select the pool's workers are gone.
-	inline, blocks := fixtureSubstitutions(bucket, name)
-	poolManifest := renderManifest(t, manifests.Pool, inline, blocks)
-	koApply(t, poolManifest)
-	t.Cleanup(func() {
-		delArgs := []string{"delete", "--ignore-not-found", "-f", poolManifest}
-		if KubeContext != "" {
-			delArgs = append([]string{"--context=" + KubeContext}, delArgs...)
-		}
-		RunCmd(t, "kubectl", delArgs...)
-	})
 
 	tmplInline, tmplBlocks := substrateTemplateSubstitutions(bucket, name, trustBundle)
 	rendered := koResolve(t, renderManifest(t, manifests.Template, tmplInline, tmplBlocks))
@@ -148,23 +139,36 @@ func DeploySubstrateFixture(t *testing.T, ctx context.Context, clients *Clients,
 		}
 	}
 
-	if _, err := clients.SubstrateAPI.CreateAtespace(ctx, &ateapipb.CreateAtespaceRequest{Atespace: &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: atespace}}}); err != nil && status.Code(err) != codes.AlreadyExists {
-		t.Fatalf("failed to create atespace %q: %v", atespace, err)
+	// Claimed before the pool is applied, so a run that cannot claim the
+	// atespace also leaves the pool and its namespace alone. Its cleanup is
+	// registered first so it runs last (t.Cleanup is LIFO).
+	claim, err := fixturecleanup.ClaimAtespace(ctx, clients.SubstrateAPI, atespace)
+	if err != nil {
+		t.Fatalf("failed to claim the fixture's atespace: %v", err)
 	}
 	t.Cleanup(func() {
-		// Best-effort: a leaked actor keeps the atespace non-empty, and the
-		// next run tolerates AlreadyExists anyway.
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
-		if _, err := clients.SubstrateAPI.DeleteAtespace(cleanupCtx, &ateapipb.DeleteAtespaceRequest{Atespace: &ateapipb.ObjectRef{Name: atespace}}); err != nil && status.Code(err) != codes.NotFound {
-			t.Logf("failed to delete atespace %q: %v", atespace, err)
+		if err := claim.Release(cleanupCtx); err != nil {
+			t.Logf("failed to release the fixture's atespace: %v", err)
 		}
+	})
+
+	// The pool manifest also carries the namespace. Its cleanup runs after
+	// the templates that select the pool's workers are gone.
+	inline, blocks := fixtureSubstitutions(bucket, name)
+	poolManifest := renderManifest(t, manifests.Pool, inline, blocks)
+	koApply(t, poolManifest)
+	t.Cleanup(func() {
+		delArgs := []string{"delete", "--ignore-not-found", "-f", poolManifest}
+		if KubeContext != "" {
+			delArgs = append([]string{"--context=" + KubeContext}, delArgs...)
+		}
+		RunCmd(t, "kubectl", delArgs...)
 	})
 
 	created := make([]*ateapipb.ActorTemplate, 0, len(templates))
 	for _, tmpl := range templates {
-		ref := &ateapipb.ObjectRef{Atespace: atespace, Name: tmpl.GetMetadata().GetName()}
-		clearLeakedSubstrateTemplate(t, ctx, clients, ref)
 		c, err := clients.SubstrateAPI.CreateActorTemplate(ctx, &ateapipb.CreateActorTemplateRequest{ActorTemplate: tmpl})
 		if err != nil {
 			t.Fatalf("failed to create ActorTemplate %s/%s: %v", atespace, tmpl.GetMetadata().GetName(), err)
@@ -174,8 +178,8 @@ func DeploySubstrateFixture(t *testing.T, ctx context.Context, clients *Clients,
 		t.Cleanup(func() {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			defer cancel()
-			if _, err := clients.SubstrateAPI.DeleteActorTemplate(cleanupCtx, &ateapipb.DeleteActorTemplateRequest{ActorTemplate: ref}); err != nil && status.Code(err) != codes.NotFound {
-				t.Logf("failed to delete ActorTemplate %s/%s: %v", atespace, ref.GetName(), err)
+			if err := claim.DeleteTemplate(cleanupCtx, c.GetMetadata().GetName(), t.Logf); err != nil {
+				t.Logf("failed to delete ActorTemplate %s/%s: %v", atespace, c.GetMetadata().GetName(), err)
 			}
 		})
 		created = append(created, c)
@@ -186,51 +190,4 @@ func DeploySubstrateFixture(t *testing.T, ctx context.Context, clients *Clients,
 		WaitForSubstrateTemplateReady(ctx, t, clients, atespace, tmpl.GetMetadata().GetName())
 	}
 	return atespace, created
-}
-
-// clearLeakedSubstrateTemplate deletes the ActorTemplate at ref if an aborted
-// earlier run left it behind. The delete is refused while actors use the
-// template, so the leaked actors that name it are deleted first.
-func clearLeakedSubstrateTemplate(t *testing.T, ctx context.Context, clients *Clients, ref *ateapipb.ObjectRef) {
-	t.Helper()
-	deleteTemplate := func() error {
-		_, err := clients.SubstrateAPI.DeleteActorTemplate(ctx, &ateapipb.DeleteActorTemplateRequest{ActorTemplate: ref})
-		return err
-	}
-	err := deleteTemplate()
-	if status.Code(err) == codes.FailedPrecondition {
-		deleteActorsNamingTemplate(t, ctx, clients, ref)
-		err = deleteTemplate()
-	}
-	if err != nil && status.Code(err) != codes.NotFound {
-		t.Fatalf("failed to clear leaked ActorTemplate %s/%s: %v", ref.GetAtespace(), ref.GetName(), err)
-	}
-}
-
-// deleteActorsNamingTemplate deletes every actor, in any atespace and any
-// state, whose actor_template is ref.
-func deleteActorsNamingTemplate(t *testing.T, ctx context.Context, clients *Clients, ref *ateapipb.ObjectRef) {
-	t.Helper()
-	pageToken := ""
-	for {
-		// An empty atespace lists across all atespaces.
-		resp, err := clients.SubstrateAPI.ListActors(ctx, &ateapipb.ListActorsRequest{PageSize: 1000, PageToken: pageToken})
-		if err != nil {
-			t.Fatalf("failed to list actors using leaked ActorTemplate %s/%s: %v", ref.GetAtespace(), ref.GetName(), err)
-		}
-		for _, actor := range resp.GetActors() {
-			if actor.GetActorTemplate().GetAtespace() != ref.GetAtespace() || actor.GetActorTemplate().GetName() != ref.GetName() {
-				continue
-			}
-			actorRef := &ateapipb.ObjectRef{Atespace: actor.GetMetadata().GetAtespace(), Name: actor.GetMetadata().GetName()}
-			t.Logf("Deleting leaked actor %s/%s that uses ActorTemplate %s/%s", actorRef.GetAtespace(), actorRef.GetName(), ref.GetAtespace(), ref.GetName())
-			if _, err := clients.SubstrateAPI.DeleteActor(ctx, &ateapipb.DeleteActorRequest{Actor: actorRef, AnyState: true}); err != nil && status.Code(err) != codes.NotFound {
-				t.Fatalf("failed to delete leaked actor %s/%s: %v", actorRef.GetAtespace(), actorRef.GetName(), err)
-			}
-		}
-		pageToken = resp.GetNextPageToken()
-		if pageToken == "" {
-			return
-		}
-	}
 }

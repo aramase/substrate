@@ -574,11 +574,18 @@ func waitForWorkerPoolInInformer(t *testing.T, tc *testContext, ns, name string)
 // testAtespace with the given worker selector and no golden snapshot.
 func createTemplateWithSelector(t *testing.T, tc *testContext, name string, selector *ateapipb.Selector) *ateapipb.ActorTemplate {
 	t.Helper()
+	return createTemplateInAtespace(t, tc, testAtespace, name, selector)
+}
+
+// createTemplateInAtespace is createTemplateWithSelector for a template in
+// atespace, which must already exist.
+func createTemplateInAtespace(t *testing.T, tc *testContext, atespace, name string, selector *ateapipb.Selector) *ateapipb.ActorTemplate {
+	t.Helper()
 	ensureDefaultGvisorSandboxConfig(t, tc)
 	created, err := tc.client.CreateActorTemplate(context.Background(), &ateapipb.CreateActorTemplateRequest{
 		ActorTemplate: &ateapipb.ActorTemplate{
 			Metadata: &ateapipb.ResourceMetadata{
-				Atespace: testAtespace,
+				Atespace: atespace,
 				Name:     name,
 			},
 			SnapshotConfig: &ateapipb.SnapshotConfig{
