@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash"
+	"log/slog"
 	"os"
 	"slices"
 	"sync"
@@ -63,7 +64,8 @@ type VerificationKey struct {
 // RefreshingPool is a wrapper around ConcretePool that periodically reloads the
 // state from disk.  This allows JWT signing and verification to continue
 // working seamlessly even as an administrator rotates the pool, without
-// requiring any components to restart.
+// requiring any components to restart. If a reload fails, it logs the error and
+// keeps the previous pool.
 type RefreshingPool struct {
 	stateFile string
 
@@ -93,20 +95,30 @@ func (p *RefreshingPool) refreshIfNecessary() error {
 		return nil
 	}
 
-	poolBytes, err := os.ReadFile(p.stateFile)
+	pool, err := loadPool(p.stateFile)
+	p.nextLoad = time.Now().Add(time.Minute)
 	if err != nil {
-		return fmt.Errorf("while reading pool state: %w", err)
+		if p.pool == nil {
+			return err
+		}
+		// Keep signing with the previous pool until the file is fixed.
+		slog.Error("Keeping previous actor JWT pool after failed reload", slog.String("file", p.stateFile), slog.Any("err", err))
+		return nil
 	}
+	p.pool = pool
+	return nil
+}
 
+func loadPool(stateFile string) (*ConcretePool, error) {
+	poolBytes, err := os.ReadFile(stateFile)
+	if err != nil {
+		return nil, fmt.Errorf("while reading pool state: %w", err)
+	}
 	pool, err := Unmarshal(poolBytes)
 	if err != nil {
-		return fmt.Errorf("while unmarshaling pool: %w", err)
+		return nil, fmt.Errorf("while unmarshaling pool: %w", err)
 	}
-
-	p.pool = pool
-	p.nextLoad = time.Now().Add(time.Minute)
-
-	return nil
+	return pool, nil
 }
 
 func (p *RefreshingPool) SignJWT(claims *actoridjwt.Claims) (string, error) {
@@ -265,21 +277,30 @@ func sign(payloadBytes []byte, signingKey crypto.PrivateKey, algorithm, keyID st
 	var sigBytes []byte
 	switch algorithm {
 	case "RS256":
-		rsaKey := signingKey.(*rsa.PrivateKey)
+		rsaKey, ok := signingKey.(*rsa.PrivateKey)
+		if !ok {
+			return "", fmt.Errorf("RS256 requires an RSA key, got %T", signingKey)
+		}
 		toBeSignedDigest := hashBytes(crypto.SHA256.New(), []byte(toBeSigned))
 		sigBytes, err = rsa.SignPKCS1v15(rand.Reader, rsaKey, crypto.SHA256, toBeSignedDigest)
 		if err != nil {
 			return "", fmt.Errorf("while performing RSA PKCS1v15 signature: %w", err)
 		}
 	case "RS384":
-		rsaKey := signingKey.(*rsa.PrivateKey)
+		rsaKey, ok := signingKey.(*rsa.PrivateKey)
+		if !ok {
+			return "", fmt.Errorf("RS384 requires an RSA key, got %T", signingKey)
+		}
 		toBeSignedDigest := hashBytes(crypto.SHA384.New(), []byte(toBeSigned))
 		sigBytes, err = rsa.SignPKCS1v15(rand.Reader, rsaKey, crypto.SHA384, toBeSignedDigest)
 		if err != nil {
 			return "", fmt.Errorf("while performing RSA PKCS1v15 signature: %w", err)
 		}
 	case "RS512":
-		rsaKey := signingKey.(*rsa.PrivateKey)
+		rsaKey, ok := signingKey.(*rsa.PrivateKey)
+		if !ok {
+			return "", fmt.Errorf("RS512 requires an RSA key, got %T", signingKey)
+		}
 		toBeSignedDigest := hashBytes(crypto.SHA512.New(), []byte(toBeSigned))
 		sigBytes, err = rsa.SignPKCS1v15(rand.Reader, rsaKey, crypto.SHA512, toBeSignedDigest)
 		if err != nil {
@@ -287,7 +308,10 @@ func sign(payloadBytes []byte, signingKey crypto.PrivateKey, algorithm, keyID st
 		}
 	case "ES256":
 		// JOSE ES256 defined at https://datatracker.ietf.org/doc/rfc7518/ section 3.4
-		ecdsaKey := signingKey.(*ecdsa.PrivateKey)
+		ecdsaKey, ok := signingKey.(*ecdsa.PrivateKey)
+		if !ok {
+			return "", fmt.Errorf("ES256 requires an ECDSA key, got %T", signingKey)
+		}
 		if ecdsaKey.Curve != elliptic.P256() {
 			return "", fmt.Errorf("ES256 requires a P256 key")
 		}
@@ -358,7 +382,8 @@ func Marshal(pool *ConcretePool) ([]byte, error) {
 	return wireBytes, nil
 }
 
-// Unmarshal loads a Pool from JSON.
+// Unmarshal loads a Pool from JSON. Each authority's key must be able to sign
+// with its algorithm.
 func Unmarshal(wireBytes []byte) (*ConcretePool, error) {
 	wire := &serializedPool{}
 
@@ -369,7 +394,7 @@ func Unmarshal(wireBytes []byte) (*ConcretePool, error) {
 	pool := &ConcretePool{
 		ActiveForSigning: wire.ActiveForSigning,
 	}
-	for _, wireAuthority := range wire.Authorities {
+	for i, wireAuthority := range wire.Authorities {
 		authority := &Authority{
 			ID:        wireAuthority.ID,
 			Algorithm: wireAuthority.Algorithm,
@@ -377,11 +402,16 @@ func Unmarshal(wireBytes []byte) (*ConcretePool, error) {
 
 		key, err := x509.ParsePKCS8PrivateKey(wireAuthority.SigningKeyPKCS8)
 		if err != nil {
-			return nil, fmt.Errorf("while parsing signing key: %w", err)
+			return nil, fmt.Errorf("authority %d (%q): while parsing signing key: %w", i, wireAuthority.ID, err)
 		}
-
-		// All key types from ParsePKCS8PrivateKey implement Signer
-		authority.SigningKey = key.(crypto.Signer)
+		signer, ok := key.(crypto.Signer)
+		if !ok {
+			return nil, fmt.Errorf("authority %d (%q): %T cannot sign", i, wireAuthority.ID, key)
+		}
+		if !algorithmFits(wireAuthority.Algorithm, signer.Public()) {
+			return nil, fmt.Errorf("authority %d (%q): algorithm %q does not fit a %T", i, wireAuthority.ID, wireAuthority.Algorithm, key)
+		}
+		authority.SigningKey = signer
 
 		pool.Authorities = append(pool.Authorities, authority)
 	}

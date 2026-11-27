@@ -15,9 +15,14 @@
 package localjwtauthority
 
 import (
+	"crypto"
+	"crypto/ecdh"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"os"
@@ -430,5 +435,183 @@ func TestVerificationKeysCarryAlgorithm(t *testing.T) {
 	}
 	if diff := cmp.Diff(map[string]string{"es": "ES256", "rs": "RS256"}, got); diff != "" {
 		t.Errorf("verification key algorithms (-want +got):\n%s", diff)
+	}
+}
+
+var testClaims = &actoridjwt.Claims{Kind: actoridjwt.KindActor, Subject: "actor/a/b", Audiences: []string{"aud"}}
+
+// marshalRaw serializes one authority without checking that key fits
+// algorithm, as a hand-edited pool file might.
+func marshalRaw(t *testing.T, id, algorithm string, key any) []byte {
+	t.Helper()
+	keyPKCS8, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("MarshalPKCS8PrivateKey: %v", err)
+	}
+	wire, err := json.Marshal(&serializedPool{
+		Authorities:      []*serializedAuthority{{ID: id, Algorithm: algorithm, SigningKeyPKCS8: keyPKCS8}},
+		ActiveForSigning: id,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
+}
+
+func TestUnmarshalChecksKeys(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p256Key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p384Key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x25519Key, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ed25519Key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name      string
+		algorithm string
+		key       any
+		wantErr   string
+	}{
+		{name: "RSA under RS256", algorithm: "RS256", key: rsaKey},
+		{name: "RSA under RS384", algorithm: "RS384", key: rsaKey},
+		{name: "RSA under RS512", algorithm: "RS512", key: rsaKey},
+		{name: "P-256 under ES256", algorithm: "ES256", key: p256Key},
+		{name: "X25519", algorithm: "ES256", key: x25519Key, wantErr: "cannot sign"},
+		{name: "RSA under ES256", algorithm: "ES256", key: rsaKey, wantErr: "does not fit"},
+		{name: "P-256 under RS256", algorithm: "RS256", key: p256Key, wantErr: "does not fit"},
+		{name: "P-384 under ES256", algorithm: "ES256", key: p384Key, wantErr: "does not fit"},
+		{name: "Ed25519 under ES256", algorithm: "ES256", key: ed25519Key, wantErr: "does not fit"},
+		{name: "unsupported algorithm", algorithm: "HS256", key: p256Key, wantErr: "does not fit"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pool, err := Unmarshal(marshalRaw(t, "bad-key", tc.algorithm, tc.key))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) || !strings.Contains(err.Error(), `authority 0 ("bad-key")`) {
+					t.Fatalf("Unmarshal error = %v, want one naming authority 0 (%q) and containing %q", err, "bad-key", tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if _, err := pool.SignJWT(testClaims); err != nil {
+				t.Errorf("SignJWT: %v", err)
+			}
+		})
+	}
+}
+
+func TestSignRejectsMismatchedKey(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p256Key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		algorithm string
+		key       crypto.Signer
+	}{
+		{algorithm: "RS256", key: p256Key},
+		{algorithm: "RS384", key: p256Key},
+		{algorithm: "RS512", key: p256Key},
+		{algorithm: "ES256", key: rsaKey},
+	}
+	for _, tc := range tests {
+		t.Run(tc.algorithm, func(t *testing.T) {
+			if _, err := sign([]byte("{}"), tc.key, tc.algorithm, "k"); err == nil {
+				t.Errorf("sign(%s, %T) returned nil error", tc.algorithm, tc.key)
+			}
+		})
+	}
+}
+
+func TestRefreshingPoolKeepsPoolAfterBadReload(t *testing.T) {
+	good1, _, err := GeneratePool("ES256", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	good2, _, err := GeneratePool("ES256", "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	x25519Key, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := marshalRaw(t, "bad", "ES256", x25519Key)
+
+	keyIDs := func(t *testing.T, p Pool) []string {
+		t.Helper()
+		keys, err := p.VerificationKeys()
+		if err != nil {
+			t.Fatalf("VerificationKeys: %v", err)
+		}
+		var ids []string
+		for _, k := range keys {
+			ids = append(ids, k.KeyID)
+		}
+		return ids
+	}
+
+	synctest.Test(t, func(t *testing.T) {
+		poolFile := filepath.Join(t.TempDir(), "pool.json")
+		if err := os.WriteFile(poolFile, good1, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		refreshingPool, err := NewRefreshingPool(poolFile)
+		if err != nil {
+			t.Fatalf("NewRefreshingPool: %v", err)
+		}
+
+		if err := os.WriteFile(poolFile, bad, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(61 * time.Second)
+		if _, err := refreshingPool.SignJWT(testClaims); err != nil {
+			t.Errorf("SignJWT after bad reload: %v", err)
+		}
+		if diff := cmp.Diff([]string{"1"}, keyIDs(t, refreshingPool)); diff != "" {
+			t.Errorf("key IDs after bad reload (-want +got):\n%s", diff)
+		}
+
+		if err := os.WriteFile(poolFile, good2, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(61 * time.Second)
+		if diff := cmp.Diff([]string{"2"}, keyIDs(t, refreshingPool)); diff != "" {
+			t.Errorf("key IDs after fixed reload (-want +got):\n%s", diff)
+		}
+	})
+}
+
+func TestNewRefreshingPoolRejectsBadPool(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolFile := filepath.Join(t.TempDir(), "pool.json")
+	if err := os.WriteFile(poolFile, marshalRaw(t, "bad", "ES256", rsaKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewRefreshingPool(poolFile); err == nil {
+		t.Error("NewRefreshingPool returned nil error for an RSA key under ES256")
 	}
 }
